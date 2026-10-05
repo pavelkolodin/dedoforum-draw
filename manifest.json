@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "nosql.ru draw attachment",
+  "version": "1.0",
+  "description": "Рисовалка (canvas + jpeg) для формы ответа на nosql.ru: вставляет рисунок в поле «Добавить вложение».",
+  "content_scripts": [
+    {
+      "matches": [
+        "*://nosql.ru/forum/*",
+        "*://www.nosql.ru/forum/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
