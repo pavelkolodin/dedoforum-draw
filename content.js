@@ -156,6 +156,125 @@
     return best;
   }
 
+  /* Vine generator: after the text is drawn, fills the empty white areas
+     with random curling tendrils (like pea shoots) that grow out of the
+     dark pixels at the edges of the text. */
+
+  var VINE_PATCH = 12;              // Edge-detection patch size, px.
+  var VINE_COUNT = 50;              // How many tendrils to grow.
+  var VINE_MIN_LEN = 30;            // Tendril length range, px.
+  var VINE_MAX_LEN = 100;
+  var VINE_START_TRIES = 300;       // Random picks per tendril start point.
+
+  function drawVines() {
+    var w = canvas.width, h = canvas.height;
+    var snap;
+    try {
+      snap = ctx.getImageData(0, 0, w, h);
+    } catch (e) {
+      return 0;
+    }
+    var pix = snap.data;
+
+    function darkAt(x, y) {
+      if (x < 0 || y < 0 || x >= w || y >= h) return false;
+      var i = (y * w + x) * 4;
+      return pix[i] + pix[i + 1] + pix[i + 2] < 384;   // Mean below 128 = dark.
+    }
+
+    // A random 12x12 patch where dark and light pixels are roughly equal
+    // is an edge of a dark shape. Start from one of its dark pixels.
+    function findStart() {
+      var total = VINE_PATCH * VINE_PATCH;
+      for (var t = 0; t < VINE_START_TRIES; t++) {
+        var sx = Math.floor(Math.random() * (w - VINE_PATCH));
+        var sy = Math.floor(Math.random() * (h - VINE_PATCH));
+        var dark = 0, darkPts = [];
+        for (var dy = 0; dy < VINE_PATCH; dy++) {
+          for (var dx = 0; dx < VINE_PATCH; dx++) {
+            if (darkAt(sx + dx, sy + dy)) {
+              dark++;
+              darkPts.push([sx + dx, sy + dy]);
+            }
+          }
+        }
+        if (dark > total * 0.2 && dark < total * 0.8) {
+          return darkPts[Math.floor(Math.random() * darkPts.length)];
+        }
+      }
+      return null;
+    }
+
+    // Pick a departure angle that runs into the whitest nearby area,
+    // so the tendril leaves the letter instead of crossing it.
+    function exitAngle(x, y) {
+      var bestAngle = Math.random() * Math.PI * 2, bestScore = -1;
+      for (var k = 0; k < 16; k++) {
+        var a = (k / 16) * Math.PI * 2 + Math.random() * 0.3;
+        var score = 0;
+        for (var r = 3; r <= 14; r += 2) {
+          if (!darkAt(Math.round(x + Math.cos(a) * r), Math.round(y + Math.sin(a) * r))) score++;
+        }
+        if (score > bestScore) { bestScore = score; bestAngle = a; }
+      }
+      return bestAngle;
+    }
+
+    function growVine(start) {
+      var steps = VINE_MIN_LEN + Math.floor(Math.random() * (VINE_MAX_LEN - VINE_MIN_LEN + 1));
+      var x = start[0] + 0.5, y = start[1] + 0.5;
+      var angle = exitAngle(start[0], start[1]);
+      var omega = (Math.random() - 0.5) * 0.06;        // Curvature: radians of turn per step.
+      var dOmega = (Math.random() - 0.5) * 0.004;      // Curvature growth rate.
+      var drift = (Math.random() - 0.5) * 0.00012;     // Progressive change of the growth rate.
+
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 1;
+
+      for (var s = 0; s < steps; s++) {
+        var t = s / steps;                              // 0 at the root, 1 at the tip.
+        var nx = x + Math.cos(angle);
+        var ny = y + Math.sin(angle);
+        if (nx < 1 || ny < 1 || nx >= w - 1 || ny >= h - 1) break;
+        if (s > 4 && darkAt(Math.round(nx), Math.round(ny))) break;   // Ran into the text.
+
+        var g = Math.round(t * 175);                    // Black root, light gray tip.
+        ctx.strokeStyle = 'rgb(' + g + ',' + g + ',' + g + ')';
+        ctx.lineWidth = 2 - t;                          // Thicker at the root, hair-thin tip.
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(nx, ny);
+        ctx.stroke();
+        x = nx;
+        y = ny;
+
+        // Bending: weak near the root, progressively stronger toward the tip,
+        // so the tendril curls around a point like a pea shoot.
+        angle += omega;
+        omega += dOmega * (0.15 + 3.5 * t * t);
+        dOmega += drift;
+
+        // Rare event: the tendril straightens out and turns the other way.
+        if (Math.random() < 0.035) {
+          dOmega = -dOmega * (0.4 + Math.random());
+          omega *= 0.35;
+        }
+        if (omega > 0.35) omega = 0.35;
+        if (omega < -0.35) omega = -0.35;
+      }
+    }
+
+    var grown = 0;
+    for (var i = 0; i < VINE_COUNT; i++) {
+      var start = findStart();
+      if (!start) break;
+      growVine(start);
+      grown++;
+    }
+    return grown;
+  }
+
   function renderText(text) {
     clearCanvas();
     text = String(text || '').replace(/\r\n?/g, '\n');
@@ -188,7 +307,6 @@
     }
     ctx.textAlign = 'start';
     ctx.textBaseline = 'alphabetic';
-    say(text ? 'Text added · draw over it or press SEND' : 'No text · draw on the blank canvas');
   }
 
   function applySize(newSize) {
@@ -372,6 +490,9 @@
       button(bottom, 'CLEAR', '', function () { clearCanvas(); });
       button(bottom, '----', '', function () { applySize(size - STEP); });
       button(bottom, '++++', '', function () { applySize(size + STEP); });
+      button(bottom, 'VINES', '', function () {
+        var n = drawVines();
+      });
       button(bottom, 'SEND', 'font-weight:bold;', sendPicture);
       statusEl = el('span', 'margin-left:6px;color:#333;');
       statusEl.id = 'nosql_paint_status';
