@@ -4,6 +4,7 @@
   'use strict';
 
   var BTN_ID = 'nosql_paint_button';
+  var TEXT_BTN_ID = 'nosql_text_button';
   var REC_BTN_ID = 'nosql_rec_button';
   var PAINT_MODAL_ID = 'nosql_paint_modal';
   var REC_MODAL_ID = 'nosql_rec_modal';
@@ -80,7 +81,9 @@
 
     var head = el('div', 'display:flex;align-items:center;justify-content:space-between;' +
       'margin:0 0 8px 2px;font-weight:bold;');
-    head.appendChild(document.createTextNode(title));
+    var titleNode = document.createTextNode(title);
+    head.appendChild(titleNode);
+    if (id === PAINT_MODAL_ID) editorTitleNode = titleNode;
     var close = el('button', 'padding:0 6px;line-height:18px;cursor:default;font:14px Arial,sans-serif;');
     close.type = 'button';
     close.title = 'Закрыть';
@@ -118,13 +121,75 @@
   var size = 800, color = '#000000', width = 3;
   var drawing = false, prev = null, hover = null;
   var canvas, ctx, overlay, octx, statusEl, paintModal;
+  var editorTitleNode = null, editorMode = 'paint';
 
   function clearCanvas() {
+    if (!ctx) return;
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (overlay && octx) octx.clearRect(0, 0, overlay.width, overlay.height);
+    drawing = false;
+    prev = null;
+    hover = null;
   }
 
   function say(text) { if (statusEl) statusEl.textContent = text || ''; }
+
+  function setEditorTitle(text) {
+    if (editorTitleNode) editorTitleNode.nodeValue = text;
+  }
+
+  function fitTextSize(text, maxWidth) {
+    var low = 8;
+    var high = Math.max(8, Math.min(canvas.width, canvas.height));
+    var best = low;
+    while (low <= high) {
+      var middle = Math.floor((low + high) / 2);
+      ctx.font = middle + 'px Arial, sans-serif';
+      if (ctx.measureText(text).width <= maxWidth - 2) {
+        best = middle;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    return best;
+  }
+
+  function renderText(text) {
+    clearCanvas();
+    text = String(text || '').replace(/\r\n?/g, '\n');
+    var lines = text.split('\n');
+    var marginX = Math.max(8, Math.round(canvas.width * 0.035));
+    var marginY = Math.max(8, Math.round(canvas.height * 0.025));
+    var maxWidth = Math.max(1, canvas.width - marginX * 2);
+    var maxHeight = Math.max(1, canvas.height - marginY * 2);
+    var rows = [];
+    var totalHeight = 0;
+
+    for (var i = 0; i < lines.length; i++) {
+      var fontSize = lines[i].length ? fitTextSize(lines[i], maxWidth) : 28;
+      rows.push({ text: lines[i], size: fontSize });
+      totalHeight += fontSize * 1.2 + 2;
+    }
+
+    var verticalScale = totalHeight > maxHeight ? maxHeight / totalHeight : 1;
+    var y = marginY;
+    ctx.fillStyle = '#000';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'top';
+    for (var row = 0; row < rows.length; row++) {
+      var drawSize = Math.max(4, Math.floor(rows[row].size * verticalScale));
+      ctx.font = drawSize + 'px Arial, sans-serif';
+      if (rows[row].text.length) {
+        ctx.fillText(rows[row].text, canvas.width / 2, y, maxWidth);
+      }
+      y += rows[row].size * 1.2 * verticalScale + 2 * verticalScale;
+    }
+    ctx.textAlign = 'start';
+    ctx.textBaseline = 'alphabetic';
+    say(text ? 'Text added · draw over it or press SEND' : 'No text · draw on the blank canvas');
+  }
 
   function applySize(newSize) {
     newSize = Math.max(MIN, Math.min(MAX, newSize));
@@ -313,6 +378,30 @@
       bottom.appendChild(statusEl);
       body.appendChild(bottom);
     });
+  }
+
+  function openPaintEditor() {
+    if (!paintModal) buildPaintModal();
+    if (editorMode !== 'paint') {
+      clearCanvas();
+      editorMode = 'paint';
+    }
+    setEditorTitle('Рисовалка (вложение)');
+    openModal(paintModal);
+    say('');
+  }
+
+  function openTextEditor() {
+    var message = document.querySelector('textarea#message');
+    if (!message) {
+      window.alert('Textarea #message was not found');
+      return;
+    }
+    if (!paintModal) buildPaintModal();
+    editorMode = 'text';
+    setEditorTitle('Текст на холсте (вложение)');
+    renderText(message.value);
+    openModal(paintModal);
   }
 
   /* ================= Audio recorder ================= */
@@ -1610,12 +1699,16 @@
     btn.id = BTN_ID;
     btn.textContent = 'Paint';
     btn.title = 'Paint a picture';
-    btn.onclick = function () {
-      if (!paintModal) buildPaintModal();
-      openModal(paintModal);
-      say('');
-    };
+    btn.onclick = openPaintEditor;
     box.appendChild(btn);
+
+    var tbtn = el('button', 'padding:2px 10px;cursor:default;font:12px Arial,sans-serif;');
+    tbtn.type = 'button';
+    tbtn.id = TEXT_BTN_ID;
+    tbtn.textContent = 'Text';
+    tbtn.title = 'Write the message text onto the canvas';
+    tbtn.onclick = openTextEditor;
+    box.appendChild(tbtn);
 
     var rbtn = el('button', 'padding:2px 10px;cursor:default;font:12px Arial,sans-serif;');
     rbtn.type = 'button';
