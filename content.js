@@ -22,8 +22,7 @@
   var STEP = 50, MIN = 50, MAX = 2000;   // Canvas size limits.
   var QUALITY = 0.95;                     // JPEG quality.
 
-  var HIST_W = 600, HIST_H = 200;         // Recorder meter size.
-  var BAR_MS = 100;                       // Initial meter bucket duration.
+  var WAVE_W = 600, WAVE_H = 200;         // Waveform canvas size.
 
   var MASK_CSS = 'position:fixed;left:0;top:0;width:100%;height:100%;z-index:2147483646;' +
     'background:rgba(0,0,0,0.6);display:flex;align-items:flex-start;justify-content:center;' +
@@ -318,19 +317,22 @@
 
   /* ================= Audio recorder ================= */
 
-  var recModal, hist, hctx, trackCanvas, trackCtx, timeEl, scaleEl, recStatus;
-  var bars = [], barMs = BAR_MS;
+  var recModal, waveCanvas, waveCtx, timeEl, recStatus;
   var recState = 'idle';                 // idle | requesting | rec | pause
-  var stream = null, audioCtx = null, analyser = null, meterSamples = null;
+  var stream = null, audioCtx = null;
   var srcNode = null, captureNode = null, silentNode = null;
   var pcmChunks = [], pcmLength = 0, pcmSamples = null, resampler = null;
-  var raf = 0, bucketMax = 0, bucketStart = 0, segStart = 0, elapsed = 0, recBase = 0;
+  var raf = 0, segStart = 0, elapsed = 0, recBase = 0;
   var captureEpoch = 0, effectEpoch = 0, sendEpoch = 0;
   var effectBusy = false, encodingBusy = false, encodeCancel = null;
   var recButtons = {};
 
   var PCM_RATE = 48000;
-  var TRACK_H = 96;
+  var WAVE_INITIAL_SECONDS = 10;
+  var waveMin = [], waveMax = [];
+  var waveSamplesPerPixel = Math.round(PCM_RATE * WAVE_INITIAL_SECONDS / WAVE_W);
+  var waveBinCount = 0, waveBinMin = 32767, waveBinMax = -32768;
+  var waveDirty = true;
 
   function fmtTime(ms) {
     var t = ms / 1000, m = Math.floor(t / 60), s = t - m * 60;
@@ -355,94 +357,132 @@
     recButtons.normalize.disabled = busy || recState !== 'idle' || !pcmSamples || !pcmSamples.length;
   }
 
-  function pushBar(value) {
-    bars.push(value);
-    if (bars.length >= HIST_W) {
-      var reduced = [];
-      for (var i = 0; i < bars.length; i += 2) {
-        reduced.push(Math.max(bars[i], bars[i + 1] === undefined ? 0 : bars[i + 1]));
+  function resetWaveform() {
+    waveMin = [];
+    waveMax = [];
+    waveSamplesPerPixel = Math.round(PCM_RATE * WAVE_INITIAL_SECONDS / WAVE_W);
+    waveBinCount = 0;
+    waveBinMin = 32767;
+    waveBinMax = -32768;
+    waveDirty = true;
+  }
+
+  function compactWaveform() {
+    var nextMin = [];
+    var nextMax = [];
+    for (var i = 0; i < waveMin.length; i += 2) {
+      var min = waveMin[i];
+      var max = waveMax[i];
+      if (i + 1 < waveMin.length) {
+        min = Math.min(min, waveMin[i + 1]);
+        max = Math.max(max, waveMax[i + 1]);
       }
-      bars = reduced;
-      barMs *= 2;
+      nextMin.push(min);
+      nextMax.push(max);
+    }
+    waveMin = nextMin;
+    waveMax = nextMax;
+    waveSamplesPerPixel *= 2;
+    waveDirty = true;
+  }
+
+  function appendWaveSample(sample) {
+    if (waveBinCount === 0) {
+      waveBinMin = sample;
+      waveBinMax = sample;
+    } else {
+      if (sample < waveBinMin) waveBinMin = sample;
+      if (sample > waveBinMax) waveBinMax = sample;
+    }
+    waveBinCount++;
+    if (waveBinCount >= waveSamplesPerPixel) {
+      waveMin.push(waveBinMin);
+      waveMax.push(waveBinMax);
+      waveBinCount = 0;
+      waveBinMin = 32767;
+      waveBinMax = -32768;
+      if (waveMin.length >= WAVE_W) compactWaveform();
     }
   }
 
-  function drawHist() {
-    if (!hctx) return;
-    hctx.fillStyle = '#fff';
-    hctx.fillRect(0, 0, HIST_W, HIST_H);
-    hctx.fillStyle = '#000';
-    for (var i = 0; i < bars.length; i++) {
-      var height = Math.round(bars[i] * HIST_H);
-      if (height > 0) hctx.fillRect(i, HIST_H - height, 1, height);
-    }
-    hctx.fillStyle = '#e22';
-    hctx.fillRect(Math.min(bars.length, HIST_W - 1), 0, 1, HIST_H);
-    if (scaleEl) {
-      scaleEl.textContent = '1 bar = ' + barMs + ' ms, total sec ' +
-        (HIST_W * barMs / 1000).toFixed(1);
-    }
+  function appendWaveSamples(samples) {
+    for (var i = 0; i < samples.length; i++) appendWaveSample(samples[i]);
+    if (samples.length) waveDirty = true;
   }
 
-  function drawTrack() {
-    if (!trackCtx) return;
-    trackCtx.fillStyle = '#fff';
-    trackCtx.fillRect(0, 0, HIST_W, TRACK_H);
-    trackCtx.strokeStyle = '#ddd';
-    trackCtx.beginPath();
-    trackCtx.moveTo(0, TRACK_H / 2);
-    trackCtx.lineTo(HIST_W, TRACK_H / 2);
-    trackCtx.stroke();
+  function drawWaveform() {
+    if (!waveCtx) return;
+    waveCtx.fillStyle = '#fff';
+    waveCtx.fillRect(0, 0, WAVE_W, WAVE_H);
 
-    if (!pcmSamples || !pcmSamples.length) {
-      trackCtx.fillStyle = '#777';
-      trackCtx.font = '12px Arial,sans-serif';
-      trackCtx.fillText('Waveform appears after STOP', 8, 16);
-      return;
+    var center = WAVE_H / 2;
+    var scale = center - 18;
+    waveCtx.strokeStyle = '#ddd';
+    waveCtx.beginPath();
+    waveCtx.moveTo(0, center);
+    waveCtx.lineTo(WAVE_W, center);
+    waveCtx.stroke();
+
+    waveCtx.fillStyle = '#174f8a';
+    var count = Math.min(waveMin.length, WAVE_W);
+    for (var x = 0; x < count; x++) {
+      var top = center - (waveMax[x] / 32768) * scale;
+      var bottom = center - (waveMin[x] / 32768) * scale;
+      waveCtx.fillRect(x, top, 1, Math.max(1, bottom - top));
+    }
+    if (waveBinCount && count < WAVE_W) {
+      var partialTop = center - (waveBinMax / 32768) * scale;
+      var partialBottom = center - (waveBinMin / 32768) * scale;
+      waveCtx.fillRect(count, partialTop, 1, Math.max(1, partialBottom - partialTop));
+    }
+    if (!count && !waveBinCount) {
+      waveCtx.fillStyle = '#777';
+      waveCtx.font = '12px Arial,sans-serif';
+      waveCtx.fillText('Press REC to start', 8, center - 5);
     }
 
-    var length = pcmSamples.length;
-    var center = TRACK_H / 2;
-    var scale = center - 4;
-    trackCtx.fillStyle = '#174f8a';
-    for (var x = 0; x < HIST_W; x++) {
-      var start = Math.floor(x * length / HIST_W);
-      if (start >= length) break;
-      var end = Math.max(start + 1, Math.floor((x + 1) * length / HIST_W));
-      if (end > length) end = length;
-      var min = 1, max = -1;
-      for (var i = start; i < end; i++) {
-        var value = pcmSamples[i] / 32768;
-        if (value < min) min = value;
-        if (value > max) max = value;
-      }
-      var top = center - max * scale;
-      var bottom = center - min * scale;
-      trackCtx.fillRect(x, top, 1, Math.max(1, bottom - top));
-    }
+    var windowSeconds = (WAVE_W * waveSamplesPerPixel / PCM_RATE).toFixed(1);
+    waveCtx.fillStyle = 'rgba(255,255,255,0.88)';
+    waveCtx.fillRect(4, 4, 82, 16);
+    waveCtx.fillStyle = '#555';
+    waveCtx.font = '11px Arial,sans-serif';
+    waveCtx.fillText(windowSeconds + ' s full width', 8, 16);
+    waveDirty = false;
   }
 
-  function meter() {
-    if (recState !== 'rec' || !analyser) { raf = 0; return; }
-    raf = requestAnimationFrame(meter);
-    var now = performance.now();
-    elapsed = recBase + (now - segStart);
+  function drawEncodingProgress(processedSamples, totalSamples) {
+    if (!waveCtx) return;
+    var percent = totalSamples > 0 ? Math.min(100, Math.floor(processedSamples * 100 / totalSamples)) : 100;
+    var progress = percent / 100;
+    waveCtx.fillStyle = '#fff';
+    waveCtx.fillRect(0, 0, WAVE_W, WAVE_H);
+    waveCtx.fillStyle = '#333';
+    waveCtx.font = '14px Arial,sans-serif';
+    waveCtx.textAlign = 'center';
+    waveCtx.fillText('Encoding Ogg/Opus', WAVE_W / 2, 66);
+    var left = 32, top = 82, width = WAVE_W - 64, height = 28;
+    waveCtx.strokeStyle = '#777';
+    waveCtx.strokeRect(left, top, width, height);
+    waveCtx.fillStyle = '#2878b8';
+    waveCtx.fillRect(left + 1, top + 1, Math.max(0, (width - 2) * progress), height - 2);
+    waveCtx.fillStyle = '#222';
+    waveCtx.font = 'bold 18px Arial,sans-serif';
+    waveCtx.fillText(percent + '%', WAVE_W / 2, 145);
+    waveCtx.textAlign = 'start';
+  }
+
+  function rebuildWaveform(samples) {
+    resetWaveform();
+    appendWaveSamples(samples);
+    drawWaveform();
+  }
+
+  function updateRecorderUi() {
+    if (recState !== 'rec') { raf = 0; return; }
+    raf = requestAnimationFrame(updateRecorderUi);
+    elapsed = recBase + (performance.now() - segStart);
     if (timeEl) timeEl.textContent = fmtTime(elapsed);
-
-    analyser.getFloatTimeDomainData(meterSamples);
-    var peak = 0;
-    for (var i = 0; i < meterSamples.length; i++) {
-      var value = Math.abs(meterSamples[i]);
-      if (value > peak) peak = value;
-    }
-    if (peak > bucketMax) bucketMax = peak;
-
-    while (now - bucketStart >= barMs) {
-      pushBar(bucketMax);
-      bucketMax = 0;
-      bucketStart += barMs;
-    }
-    drawHist();
+    if (waveDirty) drawWaveform();
   }
 
   function makeResampler(inputRate, outputRate) {
@@ -493,9 +533,13 @@
   function appendPcm(block) {
     if (!block || !block.length) return;
     var converted = new Int16Array(block.length);
-    for (var i = 0; i < block.length; i++) converted[i] = floatToInt16(block[i]);
+    for (var i = 0; i < block.length; i++) {
+      converted[i] = floatToInt16(block[i]);
+      appendWaveSample(converted[i]);
+    }
     pcmChunks.push(converted);
     pcmLength += converted.length;
+    waveDirty = true;
   }
 
   function collectPcm() {
@@ -521,10 +565,6 @@
       try { srcNode.disconnect(); } catch (e) {}
       srcNode = null;
     }
-    if (analyser) {
-      try { analyser.disconnect(); } catch (e) {}
-      analyser = null;
-    }
     if (silentNode) {
       try { silentNode.disconnect(); } catch (e) {}
       silentNode = null;
@@ -542,7 +582,6 @@
       } catch (e) {}
     }
     resampler = null;
-    meterSamples = null;
   }
 
   function failCapture(error, token) {
@@ -563,10 +602,8 @@
       if (token !== captureEpoch || recState !== 'pause') return;
       recState = 'rec';
       segStart = performance.now();
-      bucketStart = segStart;
-      bucketMax = 0;
       setRecControls();
-      meter();
+      updateRecorderUi();
       sayR('Recording');
     };
     if (audioCtx && audioCtx.state === 'suspended') {
@@ -590,13 +627,11 @@
     pcmChunks = [];
     pcmLength = 0;
     pcmSamples = null;
-    bars = [];
-    barMs = BAR_MS;
+    resetWaveform();
     elapsed = 0;
     recBase = 0;
-    bucketMax = 0;
-    drawHist();
-    drawTrack();
+    if (timeEl) timeEl.textContent = '00:00.0';
+    drawWaveform();
 
     recState = 'requesting';
     sayR('Requesting microphone access…');
@@ -627,13 +662,10 @@
         } catch (e) {
           audioCtx = new AudioContextCtor();
         }
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 2048;
         srcNode = audioCtx.createMediaStreamSource(mediaStream);
         captureNode = audioCtx.createScriptProcessor(1024, 1, 1);
         silentNode = audioCtx.createGain();
         silentNode.gain.value = 0;
-        meterSamples = new Float32Array(analyser.fftSize);
         resampler = makeResampler(audioCtx.sampleRate, PCM_RATE);
 
         captureNode.onaudioprocess = function (event) {
@@ -660,8 +692,6 @@
           appendPcm(resampler.push(mono));
         };
 
-        srcNode.connect(analyser);
-        analyser.connect(silentNode);
         srcNode.connect(captureNode);
         captureNode.connect(silentNode);
         silentNode.connect(audioCtx.destination);
@@ -673,11 +703,10 @@
       audioCtx.resume().then(function () {
         if (token !== captureEpoch || recState !== 'requesting') return;
         recState = 'rec';
-        segStart = bucketStart = performance.now();
-        bucketMax = 0;
+        segStart = performance.now();
         setRecControls();
-        drawHist();
-        meter();
+        drawWaveform();
+        updateRecorderUi();
         sayR('Recording · PCM 48 kHz / 16-bit / mono');
       }).catch(function (error) { failCapture(error, token); });
     }).catch(function (error) { failCapture(error, token); });
@@ -689,7 +718,7 @@
     raf = 0;
     recBase = elapsed;
     recState = 'pause';
-    drawHist();
+    drawWaveform();
     setRecControls();
     sayR('Paused · press RESUME to continue');
   }
@@ -711,8 +740,7 @@
     collectPcm();
     elapsed = pcmSamples.length * 1000 / PCM_RATE;
     if (timeEl) timeEl.textContent = fmtTime(elapsed);
-    drawHist();
-    drawTrack();
+    drawWaveform();
     setRecControls();
     sayR(pcmSamples.length ? 'Stopped · raw PCM is ready for effects or SEND' : 'Empty recording');
   }
@@ -868,7 +896,7 @@
         pcmSamples = result;
         effectBusy = false;
         if (timeEl) timeEl.textContent = fmtTime(pcmSamples.length * 1000 / PCM_RATE);
-        drawTrack();
+        rebuildWaveform(pcmSamples);
         setRecControls();
         sayR(label + ' applied · ' + fmtTime(pcmSamples.length * 1000 / PCM_RATE));
       });
@@ -923,18 +951,31 @@
     return output;
   }
 
-  function recordPcmWithMediaRecorder(pcm, mime, webmPadding) {
+  function recordPcmWithMediaRecorder(pcm, mime, webmPadding, onProgress) {
     return new Promise(function (resolve, reject) {
       var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextCtor) { reject(new Error('Web Audio API is not available')); return; }
 
-      var context, destination, source, recorder, watchdog;
+      var context, destination, source, recorder, watchdog, progressRaf = 0;
+      var sourceStartTime = 0, sourceStarted = false;
       var chunks = [];
       var settled = false;
       var errorOnStop = null;
 
+      function reportProgress(forceComplete) {
+        progressRaf = 0;
+        if (settled || !sourceStarted || !onProgress) return;
+        var processed = forceComplete ? pcm.length :
+          Math.min(pcm.length, Math.floor(Math.max(0, context.currentTime - sourceStartTime) * PCM_RATE));
+        onProgress(processed, pcm.length);
+        if (!forceComplete && processed < pcm.length) {
+          progressRaf = requestAnimationFrame(function () { reportProgress(false); });
+        }
+      }
+
       function cleanup() {
         if (watchdog) clearTimeout(watchdog);
+        if (progressRaf) cancelAnimationFrame(progressRaf);
         if (source) {
           try { source.disconnect(); } catch (e) {}
         }
@@ -1005,6 +1046,7 @@
           finish(null, new Blob(chunks, { type: recorder.mimeType || mime }));
         };
         source.onended = function () {
+          reportProgress(true);
           if (watchdog) clearTimeout(watchdog);
           if (recorder && recorder.state !== 'inactive') {
             try { recorder.stop(); } catch (e) { finish(e); }
@@ -1014,7 +1056,10 @@
         context.resume().then(function () {
           if (settled) return;
           recorder.start();
-          source.start(0);
+          sourceStartTime = context.currentTime;
+          sourceStarted = true;
+          source.start(sourceStartTime);
+          reportProgress(false);
           watchdog = setTimeout(function () {
             if (source) {
               try { source.stop(); } catch (e) {}
@@ -1414,12 +1459,12 @@
     return new Blob([output], { type: 'audio/ogg;codecs=opus' });
   }
 
-  function encodePcmToOgg(pcm) {
+  function encodePcmToOgg(pcm, onProgress) {
     var choice;
     try { choice = chooseOpusMime(); }
     catch (error) { return Promise.reject(error); }
 
-    return recordPcmWithMediaRecorder(pcm, choice.mime, choice.webm).then(function (blob) {
+    return recordPcmWithMediaRecorder(pcm, choice.mime, choice.webm, onProgress).then(function (blob) {
       if (!blob || !blob.size) throw new Error('The Opus encoder returned an empty file');
       if (!choice.webm) return new Blob([blob], { type: 'audio/ogg;codecs=opus' });
       return blob.arrayBuffer().then(function (buffer) {
@@ -1445,9 +1490,15 @@
     var sampleCount = pcmSamples.length;
     encodingBusy = true;
     setRecControls();
-    sayR('Encoding Ogg/Opus from PCM…');
+    drawEncodingProgress(0, sampleCount);
+    sayR('Encoding Ogg/Opus · 0%');
 
-    encodePcmToOgg(pcmSamples).then(function (blob) {
+    encodePcmToOgg(pcmSamples, function (processed, total) {
+      if (token !== sendEpoch || !recModal || !recModal.parentNode) return;
+      drawEncodingProgress(processed, total);
+      var percent = total > 0 ? Math.min(100, Math.floor(processed * 100 / total)) : 100;
+      sayR('Encoding Ogg/Opus · ' + percent + '%');
+    }).then(function (blob) {
       if (token !== sendEpoch || !recModal || !recModal.parentNode) return;
       encodingBusy = false;
       encodeCancel = null;
@@ -1456,18 +1507,18 @@
       });
       if (!attachFile(file, 'прикреплено: ' + file.name + ' (' + fmtTime(sampleCount * 1000 / PCM_RATE) + ')')) {
         sayR('Браузер не дал записать файл');
+        waveDirty = true;
+        drawWaveform();
         setRecControls();
         return;
       }
       pcmSamples = null;
       pcmChunks = [];
       pcmLength = 0;
-      bars = [];
-      barMs = BAR_MS;
+      resetWaveform();
       elapsed = 0;
       if (timeEl) timeEl.textContent = '00:00.0';
-      drawHist();
-      drawTrack();
+      drawWaveform();
       setRecControls();
       closeModal(recModal);
       sayR('');
@@ -1475,6 +1526,8 @@
       if (token !== sendEpoch) return;
       encodingBusy = false;
       encodeCancel = null;
+      waveDirty = true;
+      drawWaveform();
       setRecControls();
       sayR('Encoding failed: ' + (error && error.message ? error.message : error));
     });
@@ -1496,6 +1549,7 @@
     pcmChunks = [];
     pcmLength = 0;
     pcmSamples = null;
+    resetWaveform();
     effectBusy = false;
     encodingBusy = false;
     setRecControls();
@@ -1504,35 +1558,19 @@
 
   function buildRecModal() {
     recModal = makeModal(REC_MODAL_ID, 'Рекордер (микрофон)', function (body) {
-      hist = el('canvas', 'background:#fff;border:1px solid #333;display:block;');
-      hist.width = HIST_W;
-      hist.height = HIST_H;
-      hist.style.width = HIST_W + 'px';
-      hist.style.height = HIST_H + 'px';
-      hctx = hist.getContext('2d');
-      body.appendChild(hist);
-      drawHist();
+      waveCanvas = el('canvas', 'background:#fff;border:1px solid #333;display:block;');
+      waveCanvas.width = WAVE_W;
+      waveCanvas.height = WAVE_H;
+      waveCanvas.style.width = WAVE_W + 'px';
+      waveCanvas.style.height = WAVE_H + 'px';
+      waveCtx = waveCanvas.getContext('2d');
+      body.appendChild(waveCanvas);
+      drawWaveform();
 
-      scaleEl = el('div', 'margin:4px 0 2px 2px;color:#555;');
-      body.appendChild(scaleEl);
-
-      timeEl = el('div', 'font:22px/1.2 monospace;font-weight:bold;margin:0 0 8px 2px;');
+      timeEl = el('div', 'font:22px/1.2 monospace;font-weight:bold;margin:4px 0 8px 2px;');
       timeEl.id = 'nosql_rec_time';
       timeEl.textContent = '00:00.0';
       body.appendChild(timeEl);
-
-      var trackLabel = el('div', 'margin:4px 0;color:#333;font:11px Arial,sans-serif;');
-      trackLabel.textContent = 'Audio track · PCM 48 kHz / 16-bit / mono';
-      body.appendChild(trackLabel);
-
-      trackCanvas = el('canvas', 'background:#fff;border:1px solid #333;display:block;');
-      trackCanvas.width = HIST_W;
-      trackCanvas.height = TRACK_H;
-      trackCanvas.style.width = HIST_W + 'px';
-      trackCanvas.style.height = TRACK_H + 'px';
-      trackCtx = trackCanvas.getContext('2d');
-      body.appendChild(trackCanvas);
-      drawTrack();
 
       var effects = el('div', 'margin:5px 0 9px;display:flex;align-items:center;gap:6px;');
       recButtons.reverb = button(effects, 'REVERB', '', reverbRec);
