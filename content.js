@@ -522,6 +522,7 @@
     editorMode = 'text';
     setEditorTitle('Текст на холсте (вложение)');
     renderText(message.value);
+    message.value = "";
     openModal(paintModal);
   }
 
