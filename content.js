@@ -22,6 +22,8 @@
   ];
   var STEP = 50, MIN = 50, MAX = 2000;   // Canvas size limits.
   var QUALITY = 0.95;                     // JPEG quality.
+  var BORDER_TEXT_COLOR = 'rgba(128, 128, 128, 0.75)'; // Default color for perimeter text.
+  var BORDER_TEXT_HEIGHT = 20;                        // Font height (px) along perimeter.
 
   var WAVE_W = 600, WAVE_H = 200;         // Waveform canvas size.
 
@@ -275,38 +277,151 @@
     return grown;
   }
 
+  function drawBorderText(text, color) {
+    if (!text || !text.length || !canvas || !ctx) return;
+
+    var fontSize = BORDER_TEXT_HEIGHT;
+    var gapWidth = fontSize * 2;
+    var font = fontSize + 'px Arial, sans-serif';
+
+    ctx.save();
+    ctx.font = font;
+    ctx.fillStyle = color || BORDER_TEXT_COLOR;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    var edges = [
+      { len: canvas.width, originX: 0, originY: 0, angle: 0 },
+      { len: canvas.height, originX: canvas.width, originY: 0, angle: Math.PI / 2 },
+      { len: canvas.width, originX: canvas.width, originY: canvas.height, angle: Math.PI },
+      { len: canvas.height, originX: 0, originY: canvas.height, angle: 3 * Math.PI / 2 }
+    ];
+
+    var chars = Array.from(text);
+    var charWidths = chars.map(function (ch) {
+      return ctx.measureText(ch).width;
+    });
+
+    var edgeIdx = 0;
+    var u = 0;
+    var charIdx = 0;
+    var inGap = false;
+    var gapRemaining = 0;
+
+    function beginEdge(idx) {
+      var e = edges[idx];
+      ctx.save();
+      ctx.translate(e.originX, e.originY);
+      if (e.angle !== 0) ctx.rotate(e.angle);
+    }
+
+    function endEdge() {
+      ctx.restore();
+    }
+
+    beginEdge(edgeIdx);
+
+    while (edgeIdx < 4) {
+      if (inGap) {
+        var available = edges[edgeIdx].len - u;
+        if (gapRemaining <= available) {
+          u += gapRemaining;
+          inGap = false;
+          gapRemaining = 0;
+        } else {
+          gapRemaining -= available;
+          endEdge();
+          edgeIdx++;
+          if (edgeIdx >= 4) break;
+          beginEdge(edgeIdx);
+          u = 0;
+        }
+        continue;
+      }
+
+      var cw = charWidths[charIdx];
+      if (u + cw > edges[edgeIdx].len) {
+        if (u > 0) {
+          endEdge();
+          edgeIdx++;
+          if (edgeIdx >= 4) break;
+          beginEdge(edgeIdx);
+          u = 0;
+        }
+      }
+
+      ctx.fillText(chars[charIdx], u, 0);
+      u += cw;
+      charIdx++;
+
+      if (charIdx >= chars.length) {
+        charIdx = 0;
+        inGap = true;
+        gapRemaining = gapWidth;
+      }
+    }
+
+    if (edgeIdx < 4) {
+      endEdge();
+    }
+    ctx.restore();
+  }
+
   function renderText(text) {
     clearCanvas();
     text = String(text || '').replace(/\r\n?/g, '\n');
-    var lines = text.split('\n');
-    var marginX = Math.max(8, Math.round(canvas.width * 0.035));
-    var marginY = Math.max(8, Math.round(canvas.height * 0.025));
-    var maxWidth = Math.max(1, canvas.width - marginX * 2);
-    var maxHeight = Math.max(1, canvas.height - marginY * 2);
-    var rows = [];
-    var totalHeight = 0;
+    var rawLines = text.split('\n');
+    var normalLines = [];
+    var borderLines = [];
 
-    for (var i = 0; i < lines.length; i++) {
-      var fontSize = lines[i].length ? fitTextSize(lines[i], maxWidth) : 28;
-      rows.push({ text: lines[i], size: fontSize });
-      totalHeight += fontSize * 1.2 + 2;
-    }
-
-    var verticalScale = totalHeight > maxHeight ? maxHeight / totalHeight : 1;
-    var y = marginY;
-    ctx.fillStyle = '#000';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-    for (var row = 0; row < rows.length; row++) {
-      var drawSize = Math.max(4, Math.floor(rows[row].size * verticalScale));
-      ctx.font = drawSize + 'px Arial, sans-serif';
-      if (rows[row].text.length) {
-        ctx.fillText(rows[row].text, canvas.width / 2, y, maxWidth);
+    for (var i = 0; i < rawLines.length; i++) {
+      var line = rawLines[i];
+      if (line.indexOf('!!!') === 0) {
+        var match = line.match(/^!!!(?:#?([0-9a-fA-F]{6}))?(.*)$/);
+        var borderCol = (match && match[1]) ? ('#' + match[1]) : BORDER_TEXT_COLOR;
+        var borderTxt = (match && match[2] !== undefined) ? match[2] : line.slice(3);
+        borderLines.push({ text: borderTxt, color: borderCol });
+      } else {
+        normalLines.push(line);
       }
-      y += rows[row].size * 1.2 * verticalScale + 2 * verticalScale;
     }
-    ctx.textAlign = 'start';
-    ctx.textBaseline = 'alphabetic';
+
+    if (normalLines.length > 0) {
+      var marginX = Math.max(8, Math.round(canvas.width * 0.035));
+      var marginY = Math.max(8, Math.round(canvas.height * 0.025));
+      var maxWidth = Math.max(1, canvas.width - marginX * 2);
+      var maxHeight = Math.max(1, canvas.height - marginY * 2);
+      var rows = [];
+      var totalHeight = 0;
+
+      for (var j = 0; j < normalLines.length; j++) {
+        var fontSize = normalLines[j].length ? fitTextSize(normalLines[j], maxWidth) : 28;
+        rows.push({ text: normalLines[j], size: fontSize });
+        totalHeight += fontSize * 1.2 + 2;
+      }
+
+      var verticalScale = totalHeight > maxHeight ? maxHeight / totalHeight : 1;
+      var y = marginY;
+      ctx.fillStyle = '#000';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      for (var row = 0; row < rows.length; row++) {
+        var drawSize = Math.max(4, Math.floor(rows[row].size * verticalScale));
+        ctx.font = drawSize + 'px Arial, sans-serif';
+        if (rows[row].text.length) {
+          ctx.fillText(rows[row].text, canvas.width / 2, y, maxWidth);
+        }
+        y += rows[row].size * 1.2 * verticalScale + 2 * verticalScale;
+      }
+      ctx.textAlign = 'start';
+      ctx.textBaseline = 'alphabetic';
+    }
+
+    for (var k = 0; k < borderLines.length; k++) {
+      if (borderLines[k].text.length) {
+        drawBorderText(borderLines[k].text, borderLines[k].color);
+      }
+    }
   }
 
   function applySize(newSize) {
