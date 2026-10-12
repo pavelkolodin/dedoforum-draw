@@ -123,6 +123,31 @@
 
   var size = 800, color = '#000000', width = 3;
   var drawing = false, prev = null, hover = null;
+  var moveMode = false, movePainted = 0, moveBtn = null;
+
+  // MOVE is a two-state button: while the mode is on, the round brush melts the
+  // image (melted-film / Photoshop-smudge) instead of painting with the colour.
+  function setMoveMode(on) {
+    moveMode = !!on;
+    if (moveBtn) {
+      moveBtn.style.background = moveMode ? '#333' : '';
+      moveBtn.style.color = moveMode ? '#fff' : '';
+    }
+    if (moveMode) { drawing = false; prev = null; }
+    drawBrushCursor();
+    say(moveMode ?
+      'MOVE: режим растушёвки включён, кисть ' + Math.round(brushDiameter()) + ' px' :
+      'MOVE: режим растушёвки выключен');
+  }
+
+  // Reports the finished stroke.  A press with no pointer movement is not a
+  // stroke at all, so the status line is left alone in that case.
+  function sayMoveStroke() {
+    if (!movePainted) return;
+    say('MOVE: растушёвка кистью ' + Math.round(brushDiameter()) + ' px' +
+      ' · пройдено ' + Math.round(movePainted) + ' px');
+  }
+
   var canvas, ctx, overlay, octx, statusEl, paintModal;
   var editorTitleNode = null, editorMode = 'paint';
 
@@ -167,12 +192,16 @@
   var WEBCAM_CAMERA_WEIGHT = 0.10;
   var webcamBusy = false, webcamButtons = [], webcamStream = null, webcamToken = 0;
 
-  // MOVE effect settings.  Change these values to tune future distortion.
-  var MOVE_BRUSH_DIAMETER = 100;              // Soft round brush diameter, px.
-  var MOVE_PRESSURE = 0.12;                   // Fraction of line length used as displacement.
-  var MOVE_MIN_LINE_LENGTH = 20;              // Random drag length lower bound, px.
-  var MOVE_MAX_LINE_LENGTH = 100;             // Random drag length upper bound, px.
-  var MOVE_RANDOM_PRESSURE_VARIATION = 0.15;  // Random pressure variation: +/- 15%.
+  /* MOVE brush (melted-film / Photoshop-smudge) settings.
+     Change these values to tune the effect.  The brush diameter is not a
+     setting any more: the MOVE brush uses the round brush size picked with the
+     WIDTHS buttons, exactly like the paint brush. */
+  var MOVE_PRESSURE = 0.12;                   // Fraction of the travelled distance pulled per step.
+  var MOVE_RANDOM_PRESSURE_VARIATION = 0.15;  // Random strength variation per step: +/- 15%.
+  var MOVE_STEP_LENGTH = 12;                  // Longest single melt step along the pointer path, px.
+  var MOVE_STEP_BRUSH_RATIO = 0.15;           // Step grows with the brush, up to MOVE_STEP_LENGTH.
+  var MOVE_MAX_STEPS = 32;                    // Step limit for one pointer event (cost guard).
+  var MOVE_MIN_STEP_DISTANCE = 2;             // Shortest pointer travel that melts, canvas px.
 
   function setWebcamBusy(busy) {
     webcamBusy = busy;
@@ -420,93 +449,85 @@
     });
   }
 
-  function makeMoveLine() {
-    var width = canvas.width;
-    var height = canvas.height;
-    var maximum = Math.max(1, Math.min(MOVE_MAX_LINE_LENGTH, Math.max(width, height)));
-    var minimum = Math.min(MOVE_MIN_LINE_LENGTH, maximum);
-    var length = minimum + Math.random() * (maximum - minimum);
-    var angle = Math.random() * Math.PI * 2;
-    var dx = Math.cos(angle) * length;
-    var dy = Math.sin(angle) * length;
-    var radius = MOVE_BRUSH_DIAMETER / 2;
 
-    // Choose the centre so both virtual endpoints and the soft brush normally
-    // stay inside the canvas. Small user-resized canvases may clip the brush.
-    var marginX = radius + Math.abs(dx) / 2;
-    var marginY = radius + Math.abs(dy) / 2;
-    var minCenterX = marginX, maxCenterX = width - marginX;
-    var minCenterY = marginY, maxCenterY = height - marginY;
-    var centerX = minCenterX <= maxCenterX ?
-      minCenterX + Math.random() * (maxCenterX - minCenterX) : width / 2;
-    var centerY = minCenterY <= maxCenterY ?
-      minCenterY + Math.random() * (maxCenterY - minCenterY) : height / 2;
-
-    return {
-      startX: centerX - dx / 2,
-      startY: centerY - dy / 2,
-      endX: centerX + dx / 2,
-      endY: centerY + dy / 2,
-      length: length
-    };
-  }
-
+  // Bilinear sample of an RGB point inside one channel plane.  The canvas is
+  // always opaque, so alpha is left untouched and the displacement source
+  // colour is blended in place.  Written out per channel; this function runs
+  // for every pixel under the brush and must stay cheap.
   function sampleBilinear(data, imageWidth, imageHeight, x, y, output, outputIndex) {
     x = Math.max(0, Math.min(imageWidth - 1, x));
     y = Math.max(0, Math.min(imageHeight - 1, y));
-    var x0 = Math.floor(x), y0 = Math.floor(y);
-    var x1 = Math.min(imageWidth - 1, x0 + 1);
-    var y1 = Math.min(imageHeight - 1, y0 + 1);
+    var x0 = x | 0, y0 = y | 0;
+    var x1 = x0 < imageWidth - 1 ? x0 + 1 : x0;
+    var y1 = y0 < imageHeight - 1 ? y0 + 1 : y0;
     var xWeight = x - x0, yWeight = y - y0;
     var topLeft = (y0 * imageWidth + x0) * 4;
     var topRight = (y0 * imageWidth + x1) * 4;
     var bottomLeft = (y1 * imageWidth + x0) * 4;
     var bottomRight = (y1 * imageWidth + x1) * 4;
 
-    for (var channel = 0; channel < 4; channel++) {
-      var top = data[topLeft + channel] + (data[topRight + channel] - data[topLeft + channel]) * xWeight;
-      var bottom = data[bottomLeft + channel] +
-        (data[bottomRight + channel] - data[bottomLeft + channel]) * xWeight;
-      output[outputIndex + channel] = Math.round(top + (bottom - top) * yWeight);
-    }
+    var top = data[topLeft] + (data[topRight] - data[topLeft]) * xWeight;
+    var bottom = data[bottomLeft] + (data[bottomRight] - data[bottomLeft]) * xWeight;
+    output[outputIndex] = top + (bottom - top) * yWeight;
+
+    top = data[topLeft + 1] + (data[topRight + 1] - data[topLeft + 1]) * xWeight;
+    bottom = data[bottomLeft + 1] + (data[bottomRight + 1] - data[bottomLeft + 1]) * xWeight;
+    output[outputIndex + 1] = top + (bottom - top) * yWeight;
+
+    top = data[topLeft + 2] + (data[topRight + 2] - data[topLeft + 2]) * xWeight;
+    bottom = data[bottomLeft + 2] + (data[bottomRight + 2] - data[bottomLeft + 2]) * xWeight;
+    output[outputIndex + 2] = top + (bottom - top) * yWeight;
   }
 
-  function moveCanvasImage() {
+  // The round brush diameter shared by the paint brush and the MOVE brush.
+  function brushDiameter() {
+    return Math.max(1, width);
+  }
+
+  // One melted-film / Photoshop-smudge step: the round brush is dragged from
+  // (fromX, fromY) to (toX, toY) and each output pixel inside the swept circle
+  // pulls a softly weighted source pixel from behind the drag direction.  Only
+  // the window the brush can reach is read, and it is written back right away,
+  // so a stroke melts the already melted image step after step.
+  function applyMoveStep(fromX, fromY, toX, toY) {
     if (!canvas || !ctx) return;
 
-    var move = makeMoveLine();
-    var sourcePixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    var resultPixels = ctx.createImageData(canvas.width, canvas.height);
-    resultPixels.data.set(sourcePixels.data);
-
-    var dx = move.endX - move.startX;
-    var dy = move.endY - move.startY;
+    var dx = toX - fromX;
+    var dy = toY - fromY;
     var length = Math.sqrt(dx * dx + dy * dy);
     if (!length) return;
     var directionX = dx / length;
     var directionY = dy / length;
-    var radius = MOVE_BRUSH_DIAMETER / 2;
+    var radius = brushDiameter() / 2;
     var radiusSquared = radius * radius;
-    var minX = Math.max(0, Math.floor(Math.min(move.startX, move.endX) - radius));
-    var maxX = Math.min(canvas.width - 1, Math.ceil(Math.max(move.startX, move.endX) + radius));
-    var minY = Math.max(0, Math.floor(Math.min(move.startY, move.endY) - radius));
-    var maxY = Math.min(canvas.height - 1, Math.ceil(Math.max(move.startY, move.endY) + radius));
     var pressure = MOVE_PRESSURE *
       (1 + (Math.random() * 2 - 1) * MOVE_RANDOM_PRESSURE_VARIATION);
     pressure = Math.max(0, pressure);
-    var lineSquared = length * length;
 
-    // The circular brush is dragged from start to end. Each output pixel pulls
-    // a softly weighted source pixel from behind the drag direction, creating
-    // a subtle melted-film / Photoshop-smudge style deformation.
+    // How far behind the drag a source pixel may be taken from: the brush
+    // radius plus the longest displacement inside it.
+    var reach = radius + length * pressure + 1;
+    var minX = Math.max(0, Math.floor(Math.min(fromX, toX) - reach));
+    var maxX = Math.min(canvas.width - 1, Math.ceil(Math.max(fromX, toX) + reach));
+    var minY = Math.max(0, Math.floor(Math.min(fromY, toY) - reach));
+    var maxY = Math.min(canvas.height - 1, Math.ceil(Math.max(fromY, toY) + reach));
+    if (minX > maxX || minY > maxY) return;
+
+    var windowWidth = maxX - minX + 1;
+    var windowHeight = maxY - minY + 1;
+    var sourcePixels = ctx.getImageData(minX, minY, windowWidth, windowHeight);
+    var resultPixels = ctx.createImageData(windowWidth, windowHeight);
+    resultPixels.data.set(sourcePixels.data);
+
+    var lineSquared = length * length;
     for (var y = minY; y <= maxY; y++) {
       for (var x = minX; x <= maxX; x++) {
-        var pointX = x + 0.5 - move.startX;
-        var pointY = y + 0.5 - move.startY;
+        var pointX = x + 0.5 - fromX;
+        var pointY = y + 0.5 - fromY;
         var along = (pointX * dx + pointY * dy) / lineSquared;
         along = Math.max(0, Math.min(1, along));
-        var nearestX = move.startX + dx * along;
-        var nearestY = move.startY + dy * along;
+        var nearestX = fromX + dx * along;
+        var nearestY = fromY + dy * along;
         var distanceX = x + 0.5 - nearestX;
         var distanceY = y + 0.5 - nearestY;
         var distanceSquared = distanceX * distanceX + distanceY * distanceY;
@@ -516,15 +537,37 @@
         var edge = 1 - Math.sqrt(distanceSquared) / radius;
         var brushWeight = edge * edge * (3 - 2 * edge);
         var displacement = length * pressure * brushWeight;
-        var targetIndex = (y * canvas.width + x) * 4;
-        sampleBilinear(sourcePixels.data, canvas.width, canvas.height,
-          x - directionX * displacement, y - directionY * displacement,
+        var targetIndex = ((y - minY) * windowWidth + (x - minX)) * 4;
+        sampleBilinear(sourcePixels.data, windowWidth, windowHeight,
+          x - minX - directionX * displacement, y - minY - directionY * displacement,
           resultPixels.data, targetIndex);
       }
     }
 
-    ctx.putImageData(resultPixels, 0, 0);
-    say('MOVE: ' + Math.round(length) + ' px · кисть ' + MOVE_BRUSH_DIAMETER + ' px');
+    ctx.putImageData(resultPixels, minX, minY);
+  }
+
+  // The MOVE brush melts the image along the pointer path.  A pointer jump is
+  // split into steps no longer than the step length — a fraction of the brush
+  // diameter, capped by MOVE_STEP_LENGTH — so the amount of melting follows the
+  // travelled distance and does not depend on the pointer event rate.  The step
+  // also keeps the displacement small relative to the brush, which is what
+  // makes the effect look like a smudge rather than a broken image.
+  function moveBrushStroke(fromX, fromY, toX, toY) {
+    if (!canvas || !ctx) return;
+
+    var dx = toX - fromX;
+    var dy = toY - fromY;
+    var length = Math.sqrt(dx * dx + dy * dy);
+    if (!length) return;
+    var maxStep = Math.max(1, Math.min(MOVE_STEP_LENGTH, brushDiameter() * MOVE_STEP_BRUSH_RATIO));
+    var steps = Math.min(MOVE_MAX_STEPS, Math.max(1, Math.ceil(length / maxStep)));
+
+    for (var i = 0; i < steps; i++) {
+      var from = i / steps, to = (i + 1) / steps;
+      applyMoveStep(fromX + dx * from, fromY + dy * from,
+        fromX + dx * to, fromY + dy * to);
+    }
   }
 
   function drawBorderText(text, color) {
@@ -731,8 +774,26 @@
   function drawBrushCursor() {
     octx.clearRect(0, 0, overlay.width, overlay.height);
     if (!hover) return;
+    var radius = width / 2;
+    // In MOVE mode the brush does not paint: it smears the image, so the
+    // cursor is a hollow double circle instead of a colour blob.
+    if (moveMode) {
+      var inner = Math.max(0, radius - 3);
+      octx.globalAlpha = 0.85;
+      octx.strokeStyle = 'rgba(0,0,0,0.9)';
+      octx.lineWidth = 1;
+      octx.beginPath();
+      octx.arc(hover.x, hover.y, Math.max(1, radius), 0, Math.PI * 2);
+      octx.stroke();
+      octx.strokeStyle = 'rgba(255,255,255,0.9)';
+      octx.beginPath();
+      octx.arc(hover.x, hover.y, Math.max(1, inner), 0, Math.PI * 2);
+      octx.stroke();
+      octx.globalAlpha = 1;
+      return;
+    }
     octx.beginPath();
-    octx.arc(hover.x, hover.y, width / 2, 0, Math.PI * 2);
+    octx.arc(hover.x, hover.y, radius, 0, Math.PI * 2);
     octx.globalAlpha = 0.35;               // Translucent brush preview.
     octx.fillStyle = color;
     octx.fill();
@@ -811,21 +872,55 @@
         drawing = true;
         prev = point(e);
         hover = prev;
-        dot(prev);
+        if (moveMode) {
+          // MOVE brush: a press only starts the stroke, it changes nothing.
+          // The melt is applied on pointermove, along the travelled vector, so
+          // clicking without moving the pointer leaves the canvas untouched.
+          movePainted = 0;
+        } else {
+          dot(prev);
+        }
         drawBrushCursor();
         if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
         e.preventDefault();
       });
       canvas.addEventListener('pointermove', function (e) {
         hover = point(e);
-        if (drawing) { line(prev, hover); prev = hover; }
+        if (drawing) {
+          if (moveMode) {
+            // The melt follows the pointer vector and nothing else: a step is
+            // applied only once the pointer has really travelled, so clicks,
+            // zero-delta moves and sub-pixel jitter leave the image alone.
+            // prev stays at the last melted point, so slow drags accumulate
+            // their movement instead of losing it.
+            var moveDX = hover.x - prev.x;
+            var moveDY = hover.y - prev.y;
+            var travelled = Math.sqrt(moveDX * moveDX + moveDY * moveDY);
+            if (travelled >= MOVE_MIN_STEP_DISTANCE) {
+              moveBrushStroke(prev.x, prev.y, hover.x, hover.y);
+              movePainted += travelled;
+              prev = hover;
+            }
+          } else {
+            line(prev, hover);
+            prev = hover;
+          }
+        }
         drawBrushCursor();
       });
-      canvas.addEventListener('pointerup', function () { drawing = false; prev = null; });
+      canvas.addEventListener('pointerup', function () {
+        if (drawing && moveMode) sayMoveStroke();
+        drawing = false;
+        prev = null;
+      });
       canvas.addEventListener('pointercancel', function () { drawing = false; prev = null; });
       canvas.addEventListener('pointerleave', function () { hover = null; drawBrushCursor(); });
       canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-      window.addEventListener('pointerup', function () { drawing = false; prev = null; });
+      window.addEventListener('pointerup', function () {
+        if (drawing && moveMode) sayMoveStroke();
+        drawing = false;
+        prev = null;
+      });
 
       wrap.appendChild(canvas);
       wrap.appendChild(overlay);
@@ -862,8 +957,13 @@
       var w3 = button(bottom, 'w3', '', function () { captureWebcam('binary'); });
       w3.title = 'Снимок с веб-камеры строго в чёрном и белом, не более 30% чёрных пикселей';
       webcamButtons = [w1, w2, w3];
-      button(bottom, 'MOVE', '', moveCanvasImage).title =
-        'Слегка потянуть случайный участок изображения мягкой круглой кистью';
+      // MOVE is a two-state mode button, highlighted black while enabled, just
+      // like the WIDTHS buttons: while it is on, the round brush melts the
+      // image (melted-film / Photoshop-smudge) instead of painting colour.
+      moveBtn = button(bottom, 'MOVE', '', function () { setMoveMode(!moveMode); });
+      moveBtn.title = 'Режим растушёвки: кисть размазывает изображение ' +
+        '(melted-film / Photoshop-smudge) вместо рисования цветом';
+      setMoveMode(false);
       button(bottom, 'SEND', 'font-weight:bold;', sendPicture);
       statusEl = el('span', 'margin-left:6px;color:#333;');
       statusEl.id = 'nosql_paint_status';
