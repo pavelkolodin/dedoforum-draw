@@ -113,6 +113,7 @@
   }
 
   function closeModal(modal) {
+    if (modal === paintModal) stopWebcamCapture();
     if (modal && modal.parentNode) modal.parentNode.removeChild(modal);
     var open = (paintModal && paintModal.parentNode) || (recModal && recModal.parentNode);
     if (!open) document.body.style.overflow = '';
@@ -158,123 +159,247 @@
     return best;
   }
 
-  /* Vine generator: after the text is drawn, fills the empty white areas
-     with random curling tendrils (like pea shoots) that grow out of the
-     dark pixels at the edges of the text. */
+  /* Webcam snapshot: keeps the existing drawing above an adaptive grayscale photo. */
 
-  var VINE_PATCH = 12;              // Edge-detection patch size, px.
-  var VINE_COUNT = 50;              // How many tendrils to grow.
-  var VINE_MIN_LEN = 30;            // Tendril length range, px.
-  var VINE_MAX_LEN = 100;
-  var VINE_START_TRIES = 300;       // Random picks per tendril start point.
+  var WEBCAM_GRAYSCALE_LEVELS = 16;
+  var WEBCAM_MAX_DARK_RATIO = 0.30;
+  var webcamBusy = false, webcamButton = null, webcamStream = null, webcamToken = 0;
 
-  function drawVines() {
-    var w = canvas.width, h = canvas.height;
-    var snap;
-    try {
-      snap = ctx.getImageData(0, 0, w, h);
-    } catch (e) {
-      return 0;
+  function setWebcamBusy(busy) {
+    webcamBusy = busy;
+    if (webcamButton) webcamButton.disabled = busy;
+  }
+
+  function stopWebcamStream(stream) {
+    if (!stream) return;
+    stream.getTracks().forEach(function (track) { track.stop(); });
+  }
+
+  function stopWebcamCapture() {
+    webcamToken++;
+    stopWebcamStream(webcamStream);
+    webcamStream = null;
+    setWebcamBusy(false);
+  }
+
+  function waitForVideoFrame(video) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(new Error('Timed out while waiting for a camera frame'));
+      }, 10000);
+
+      function cleanup() {
+        clearTimeout(timer);
+        video.removeEventListener('loadeddata', ready);
+        video.removeEventListener('canplay', ready);
+        video.removeEventListener('error', failed);
+      }
+
+      function finish(error) {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      }
+
+      function ready() {
+        if (!video.videoWidth || !video.videoHeight) return;
+        // Let the decoder present a frame before reading pixels from the video.
+        window.requestAnimationFrame(function () { finish(); });
+      }
+
+      function failed() { finish(new Error('Could not read a frame from the camera')); }
+
+      video.addEventListener('loadeddata', ready);
+      video.addEventListener('canplay', ready);
+      video.addEventListener('error', failed);
+      if (video.readyState >= 2) ready();
+
+      var playing;
+      try {
+        playing = video.play();
+      } catch (error) {
+        finish(error);
+        return;
+      }
+      if (playing && playing.catch) playing.catch(finish);
+    });
+  }
+
+  // The camera is cropped, never stretched: a central square up to 800x800.
+  // On a smaller camera (or a manually reduced canvas) the square is smaller
+  // and is placed in the centre of the drawing canvas.
+  function putWebcamUnderDrawing(video) {
+    var square = Math.floor(Math.min(
+      video.videoWidth,
+      video.videoHeight,
+      800,
+      canvas.width,
+      canvas.height
+    ));
+    if (!square) throw new Error('The camera returned an empty image');
+
+    var sourceX = Math.floor((video.videoWidth - square) / 2);
+    var sourceY = Math.floor((video.videoHeight - square) / 2);
+    var targetX = Math.floor((canvas.width - square) / 2);
+    var targetY = Math.floor((canvas.height - square) / 2);
+
+    // buffer is the required black-and-white webcam layer.
+    var buffer = document.createElement('canvas');
+    buffer.width = canvas.width;
+    buffer.height = canvas.height;
+    var bufferCtx = buffer.getContext('2d');
+    bufferCtx.fillStyle = '#fff';
+    bufferCtx.fillRect(0, 0, buffer.width, buffer.height);
+    bufferCtx.drawImage(video,
+      sourceX, sourceY, square, square,
+      targetX, targetY, square, square);
+
+    var cameraPixels = bufferCtx.getImageData(0, 0, buffer.width, buffer.height);
+    var grayPixels = new Uint8Array(square * square);
+    var grayIndex = 0;
+    var y, x, pixelIndex;
+
+    // Measure the unmodified photo only: the white area around a small camera
+    // image must not make a dark photo appear artificially light.
+    for (y = 0; y < square; y++) {
+      for (x = 0; x < square; x++) {
+        pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
+        // ITU-R BT.601 luminance.
+        grayPixels[grayIndex++] = Math.round(
+          cameraPixels.data[pixelIndex] * 0.299 +
+          cameraPixels.data[pixelIndex + 1] * 0.587 +
+          cameraPixels.data[pixelIndex + 2] * 0.114
+        );
+      }
     }
-    var pix = snap.data;
 
-    function darkAt(x, y) {
-      if (x < 0 || y < 0 || x >= w || y >= h) return false;
-      var i = (y * w + x) * 4;
-      return pix[i] + pix[i + 1] + pix[i + 2] < 384;   // Mean below 128 = dark.
+    function levelFor(gray, brightness) {
+      var adjusted = Math.min(255, gray + brightness);
+      return Math.round(adjusted * (WEBCAM_GRAYSCALE_LEVELS - 1) / 255);
     }
 
-    // A random 12x12 patch where dark and light pixels are roughly equal
-    // is an edge of a dark shape. Start from one of its dark pixels.
-    function findStart() {
-      var total = VINE_PATCH * VINE_PATCH;
-      for (var t = 0; t < VINE_START_TRIES; t++) {
-        var sx = Math.floor(Math.random() * (w - VINE_PATCH));
-        var sy = Math.floor(Math.random() * (h - VINE_PATCH));
-        var dark = 0, darkPts = [];
-        for (var dy = 0; dy < VINE_PATCH; dy++) {
-          for (var dx = 0; dx < VINE_PATCH; dx++) {
-            if (darkAt(sx + dx, sy + dy)) {
-              dark++;
-              darkPts.push([sx + dx, sy + dy]);
-            }
-          }
-        }
-        if (dark > total * 0.2 && dark < total * 0.8) {
-          return darkPts[Math.floor(Math.random() * darkPts.length)];
+    // Levels 0…7 are dark; 8…15 are light.  Brightness is selected after
+    // quantisation, so the final 16-level picture has at most 30% dark pixels.
+    function darkPixelCount(brightness) {
+      var count = 0;
+      for (var k = 0; k < grayPixels.length; k++) {
+        if (levelFor(grayPixels[k], brightness) < WEBCAM_GRAYSCALE_LEVELS / 2) count++;
+      }
+      return count;
+    }
+
+    var maxDarkPixels = grayPixels.length * WEBCAM_MAX_DARK_RATIO;
+    var brightness = 0;
+    if (darkPixelCount(0) > maxDarkPixels) {
+      // Dark-pixel count falls monotonically when brightness rises; find the
+      // smallest correction that satisfies the 30% limit in nine iterations.
+      var lowBrightness = 0;
+      var highBrightness = 255;
+      while (lowBrightness < highBrightness) {
+        var middleBrightness = Math.floor((lowBrightness + highBrightness) / 2);
+        if (darkPixelCount(middleBrightness) <= maxDarkPixels) {
+          highBrightness = middleBrightness;
+        } else {
+          lowBrightness = middleBrightness + 1;
         }
       }
-      return null;
+      brightness = lowBrightness;
     }
 
-    // Pick a departure angle that runs into the whitest nearby area,
-    // so the tendril leaves the letter instead of crossing it.
-    function exitAngle(x, y) {
-      var bestAngle = Math.random() * Math.PI * 2, bestScore = -1;
-      for (var k = 0; k < 16; k++) {
-        var a = (k / 16) * Math.PI * 2 + Math.random() * 0.3;
-        var score = 0;
-        for (var r = 3; r <= 14; r += 2) {
-          if (!darkAt(Math.round(x + Math.cos(a) * r), Math.round(y + Math.sin(a) * r))) score++;
-        }
-        if (score > bestScore) { bestScore = score; bestAngle = a; }
-      }
-      return bestAngle;
-    }
-
-    function growVine(start) {
-      var steps = VINE_MIN_LEN + Math.floor(Math.random() * (VINE_MAX_LEN - VINE_MIN_LEN + 1));
-      var x = start[0] + 0.5, y = start[1] + 0.5;
-      var angle = exitAngle(start[0], start[1]);
-      var omega = (Math.random() - 0.5) * 0.06;        // Curvature: radians of turn per step.
-      var dOmega = (Math.random() - 0.5) * 0.004;      // Curvature growth rate.
-      var drift = (Math.random() - 0.5) * 0.00012;     // Progressive change of the growth rate.
-
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.lineWidth = 1;
-
-      for (var s = 0; s < steps; s++) {
-        var t = s / steps;                              // 0 at the root, 1 at the tip.
-        var nx = x + Math.cos(angle);
-        var ny = y + Math.sin(angle);
-        if (nx < 1 || ny < 1 || nx >= w - 1 || ny >= h - 1) break;
-        if (s > 4 && darkAt(Math.round(nx), Math.round(ny))) break;   // Ran into the text.
-
-        var g = Math.round(t * 175);                    // Black root, light gray tip.
-        ctx.strokeStyle = 'rgb(' + g + ',' + g + ',' + g + ')';
-        ctx.lineWidth = 2 - t;                          // Thicker at the root, hair-thin tip.
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-        ctx.lineTo(nx, ny);
-        ctx.stroke();
-        x = nx;
-        y = ny;
-
-        // Bending: weak near the root, progressively stronger toward the tip,
-        // so the tendril curls around a point like a pea shoot.
-        angle += omega;
-        omega += dOmega * (0.15 + 3.5 * t * t);
-        dOmega += drift;
-
-        // Rare event: the tendril straightens out and turns the other way.
-        if (Math.random() < 0.035) {
-          dOmega = -dOmega * (0.4 + Math.random());
-          omega *= 0.35;
-        }
-        if (omega > 0.35) omega = 0.35;
-        if (omega < -0.35) omega = -0.35;
+    grayIndex = 0;
+    for (y = 0; y < square; y++) {
+      for (x = 0; x < square; x++) {
+        pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
+        var level = levelFor(grayPixels[grayIndex++], brightness);
+        // 16 evenly distributed neutral colours: 0, 17, 34, …, 255.
+        var value = Math.round(level * 255 / (WEBCAM_GRAYSCALE_LEVELS - 1));
+        cameraPixels.data[pixelIndex] = value;
+        cameraPixels.data[pixelIndex + 1] = value;
+        cameraPixels.data[pixelIndex + 2] = value;
+        cameraPixels.data[pixelIndex + 3] = 255;
       }
     }
+    bufferCtx.putImageData(cameraPixels, 0, 0);
 
-    var grown = 0;
-    for (var i = 0; i < VINE_COUNT; i++) {
-      var start = findStart();
-      if (!start) break;
-      growVine(start);
-      grown++;
+    // buffer2 is a snapshot of the drawing that was already on the canvas.
+    var buffer2 = document.createElement('canvas');
+    buffer2.width = canvas.width;
+    buffer2.height = canvas.height;
+    var buffer2Ctx = buffer2.getContext('2d');
+    buffer2Ctx.drawImage(canvas, 0, 0);
+
+    // Rebuild the main canvas from buffer, then restore only non-white pixels
+    // from buffer2. This leaves the webcam photo underneath the old drawing.
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(buffer, 0, 0);
+    var resultPixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    var drawingPixels = buffer2Ctx.getImageData(0, 0, buffer2.width, buffer2.height);
+    for (var j = 0; j < drawingPixels.data.length; j += 4) {
+      if (drawingPixels.data[j] !== 255 || drawingPixels.data[j + 1] !== 255 ||
+          drawingPixels.data[j + 2] !== 255) {
+        resultPixels.data[j] = drawingPixels.data[j];
+        resultPixels.data[j + 1] = drawingPixels.data[j + 1];
+        resultPixels.data[j + 2] = drawingPixels.data[j + 2];
+        resultPixels.data[j + 3] = drawingPixels.data[j + 3];
+      }
     }
-    return grown;
+    ctx.putImageData(resultPixels, 0, 0);
+    return { size: square, brightness: brightness };
+  }
+
+  function webcamErrorMessage(error) {
+    var name = error && error.name ? error.name : '';
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') return 'доступ к веб-камере не разрешён';
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError') return 'веб-камера не найдена';
+    if (name === 'NotReadableError' || name === 'TrackStartError') return 'веб-камера занята другим приложением';
+    return (error && error.message) || name || String(error || 'Unknown error');
+  }
+
+  function captureWebcam() {
+    if (webcamBusy) return;
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      say('Веб-камера доступна только на HTTPS-странице в современном браузере');
+      return;
+    }
+
+    var token = ++webcamToken;
+    var stream = null;
+    var video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    setWebcamBusy(true);
+    say('Запрашивается доступ к веб-камере…');
+
+    navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+    }).then(function (mediaStream) {
+      if (token !== webcamToken) {
+        stopWebcamStream(mediaStream);
+        throw { cancelled: true };
+      }
+      stream = mediaStream;
+      webcamStream = stream;
+      video.srcObject = stream;
+      return waitForVideoFrame(video);
+    }).then(function () {
+      if (token !== webcamToken) throw { cancelled: true };
+      var webcamImage = putWebcamUnderDrawing(video);
+      var brightnessNote = webcamImage.brightness ? ' · яркость +' + webcamImage.brightness : '';
+      say('Фото с веб-камеры добавлено: ' + webcamImage.size + '×' + webcamImage.size + brightnessNote);
+    }).catch(function (error) {
+      if (!error || !error.cancelled) say('Веб-камера: ' + webcamErrorMessage(error));
+    }).then(function () {
+      try { video.pause(); } catch (e) {}
+      video.srcObject = null;
+      stopWebcamStream(stream);
+      if (webcamStream === stream) webcamStream = null;
+      if (token === webcamToken) setWebcamBusy(false);
+    });
   }
 
   function drawBorderText(text, color) {
@@ -605,9 +730,8 @@
       button(bottom, 'CLEAR', '', function () { clearCanvas(); });
       button(bottom, '----', '', function () { applySize(size - STEP); });
       button(bottom, '++++', '', function () { applySize(size + STEP); });
-      button(bottom, 'VINES', '', function () {
-        var n = drawVines();
-      });
+      webcamButton = button(bottom, 'WEBCAM', '', captureWebcam);
+      webcamButton.title = 'Сделать чёрно-белый снимок с веб-камеры под рисунком';
       button(bottom, 'SEND', 'font-weight:bold;', sendPicture);
       statusEl = el('span', 'margin-left:6px;color:#333;');
       statusEl.id = 'nosql_paint_status';
