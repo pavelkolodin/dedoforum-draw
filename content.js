@@ -159,15 +159,24 @@
     return best;
   }
 
-  /* Webcam snapshot: keeps the existing drawing above an adaptive grayscale photo. */
+  /* Webcam snapshots: colour, adaptive 16-gray, or adaptive binary photo. */
 
   var WEBCAM_GRAYSCALE_LEVELS = 16;
   var WEBCAM_MAX_DARK_RATIO = 0.30;
-  var webcamBusy = false, webcamButton = null, webcamStream = null, webcamToken = 0;
+  var WEBCAM_CANVAS_WEIGHT = 0.90;
+  var WEBCAM_CAMERA_WEIGHT = 0.10;
+  var webcamBusy = false, webcamButtons = [], webcamStream = null, webcamToken = 0;
+
+  // MOVE effect settings.  Change these values to tune future distortion.
+  var MOVE_BRUSH_DIAMETER = 100;              // Soft round brush diameter, px.
+  var MOVE_PRESSURE = 0.12;                   // Fraction of line length used as displacement.
+  var MOVE_MIN_LINE_LENGTH = 20;              // Random drag length lower bound, px.
+  var MOVE_MAX_LINE_LENGTH = 100;             // Random drag length upper bound, px.
+  var MOVE_RANDOM_PRESSURE_VARIATION = 0.15;  // Random pressure variation: +/- 15%.
 
   function setWebcamBusy(busy) {
     webcamBusy = busy;
-    if (webcamButton) webcamButton.disabled = busy;
+    for (var i = 0; i < webcamButtons.length; i++) webcamButtons[i].disabled = busy;
   }
 
   function stopWebcamStream(stream) {
@@ -231,7 +240,7 @@
   // The camera is cropped, never stretched: a central square up to 800x800.
   // On a smaller camera (or a manually reduced canvas) the square is smaller
   // and is placed in the centre of the drawing canvas.
-  function putWebcamUnderDrawing(video) {
+  function putWebcamUnderDrawing(video, mode) {
     var square = Math.floor(Math.min(
       video.videoWidth,
       video.videoHeight,
@@ -246,7 +255,7 @@
     var targetX = Math.floor((canvas.width - square) / 2);
     var targetY = Math.floor((canvas.height - square) / 2);
 
-    // buffer is the required black-and-white webcam layer.
+    // buffer is the webcam layer before the existing drawing is restored.
     var buffer = document.createElement('canvas');
     buffer.width = canvas.width;
     buffer.height = canvas.height;
@@ -258,71 +267,78 @@
       targetX, targetY, square, square);
 
     var cameraPixels = bufferCtx.getImageData(0, 0, buffer.width, buffer.height);
-    var grayPixels = new Uint8Array(square * square);
-    var grayIndex = 0;
-    var y, x, pixelIndex;
-
-    // Measure the unmodified photo only: the white area around a small camera
-    // image must not make a dark photo appear artificially light.
-    for (y = 0; y < square; y++) {
-      for (x = 0; x < square; x++) {
-        pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
-        // ITU-R BT.601 luminance.
-        grayPixels[grayIndex++] = Math.round(
-          cameraPixels.data[pixelIndex] * 0.299 +
-          cameraPixels.data[pixelIndex + 1] * 0.587 +
-          cameraPixels.data[pixelIndex + 2] * 0.114
-        );
-      }
-    }
-
-    function levelFor(gray, brightness) {
-      var adjusted = Math.min(255, gray + brightness);
-      return Math.round(adjusted * (WEBCAM_GRAYSCALE_LEVELS - 1) / 255);
-    }
-
-    // Levels 0…7 are dark; 8…15 are light.  Brightness is selected after
-    // quantisation, so the final 16-level picture has at most 30% dark pixels.
-    function darkPixelCount(brightness) {
-      var count = 0;
-      for (var k = 0; k < grayPixels.length; k++) {
-        if (levelFor(grayPixels[k], brightness) < WEBCAM_GRAYSCALE_LEVELS / 2) count++;
-      }
-      return count;
-    }
-
-    var maxDarkPixels = grayPixels.length * WEBCAM_MAX_DARK_RATIO;
     var brightness = 0;
-    if (darkPixelCount(0) > maxDarkPixels) {
-      // Dark-pixel count falls monotonically when brightness rises; find the
-      // smallest correction that satisfies the 30% limit in nine iterations.
-      var lowBrightness = 0;
-      var highBrightness = 255;
-      while (lowBrightness < highBrightness) {
-        var middleBrightness = Math.floor((lowBrightness + highBrightness) / 2);
-        if (darkPixelCount(middleBrightness) <= maxDarkPixels) {
-          highBrightness = middleBrightness;
-        } else {
-          lowBrightness = middleBrightness + 1;
+
+    // w1 deliberately leaves the captured pixels untouched and in colour.
+    // w2 uses 16 gray levels; w3 uses only pure black and pure white.
+    if (mode !== 'color') {
+      var grayscaleLevels = mode === 'binary' ? 2 : WEBCAM_GRAYSCALE_LEVELS;
+      var grayPixels = new Uint8Array(square * square);
+      var grayIndex = 0;
+      var y, x, pixelIndex;
+
+      // Measure the camera square only: white canvas margins must not make a
+      // dark photo appear artificially light.
+      for (y = 0; y < square; y++) {
+        for (x = 0; x < square; x++) {
+          pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
+          // ITU-R BT.601 luminance.
+          grayPixels[grayIndex++] = Math.round(
+            cameraPixels.data[pixelIndex] * 0.299 +
+            cameraPixels.data[pixelIndex + 1] * 0.587 +
+            cameraPixels.data[pixelIndex + 2] * 0.114
+          );
         }
       }
-      brightness = lowBrightness;
-    }
 
-    grayIndex = 0;
-    for (y = 0; y < square; y++) {
-      for (x = 0; x < square; x++) {
-        pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
-        var level = levelFor(grayPixels[grayIndex++], brightness);
-        // 16 evenly distributed neutral colours: 0, 17, 34, …, 255.
-        var value = Math.round(level * 255 / (WEBCAM_GRAYSCALE_LEVELS - 1));
-        cameraPixels.data[pixelIndex] = value;
-        cameraPixels.data[pixelIndex + 1] = value;
-        cameraPixels.data[pixelIndex + 2] = value;
-        cameraPixels.data[pixelIndex + 3] = 255;
+      function levelFor(gray, addedBrightness) {
+        var adjusted = Math.min(255, gray + addedBrightness);
+        return Math.round(adjusted * (grayscaleLevels - 1) / 255);
       }
+
+      // For w2, levels 0…7 are dark and 8…15 are light.  For w3, level 0
+      // is black and level 1 is white.  Brightness is chosen after palette
+      // quantisation, so the finished image has no more than 30% dark pixels.
+      function darkPixelCount(addedBrightness) {
+        var count = 0;
+        for (var k = 0; k < grayPixels.length; k++) {
+          if (levelFor(grayPixels[k], addedBrightness) < grayscaleLevels / 2) count++;
+        }
+        return count;
+      }
+
+      var maxDarkPixels = grayPixels.length * WEBCAM_MAX_DARK_RATIO;
+      if (darkPixelCount(0) > maxDarkPixels) {
+        // Dark-pixel count falls monotonically when brightness rises; find the
+        // smallest correction that satisfies the 30% limit in nine iterations.
+        var lowBrightness = 0;
+        var highBrightness = 255;
+        while (lowBrightness < highBrightness) {
+          var middleBrightness = Math.floor((lowBrightness + highBrightness) / 2);
+          if (darkPixelCount(middleBrightness) <= maxDarkPixels) {
+            highBrightness = middleBrightness;
+          } else {
+            lowBrightness = middleBrightness + 1;
+          }
+        }
+        brightness = lowBrightness;
+      }
+
+      grayIndex = 0;
+      for (y = 0; y < square; y++) {
+        for (x = 0; x < square; x++) {
+          pixelIndex = ((targetY + y) * buffer.width + targetX + x) * 4;
+          var level = levelFor(grayPixels[grayIndex++], brightness);
+          // w2: 0, 17, 34, …, 255.  w3: exactly 0 or 255.
+          var value = Math.round(level * 255 / (grayscaleLevels - 1));
+          cameraPixels.data[pixelIndex] = value;
+          cameraPixels.data[pixelIndex + 1] = value;
+          cameraPixels.data[pixelIndex + 2] = value;
+          cameraPixels.data[pixelIndex + 3] = 255;
+        }
+      }
+      bufferCtx.putImageData(cameraPixels, 0, 0);
     }
-    bufferCtx.putImageData(cameraPixels, 0, 0);
 
     // buffer2 is a snapshot of the drawing that was already on the canvas.
     var buffer2 = document.createElement('canvas');
@@ -331,20 +347,22 @@
     var buffer2Ctx = buffer2.getContext('2d');
     buffer2Ctx.drawImage(canvas, 0, 0);
 
-    // Rebuild the main canvas from buffer, then restore only non-white pixels
-    // from buffer2. This leaves the webcam photo underneath the old drawing.
+    // Every pixel participates in the blend, including white pixels. The
+    // existing canvas remains dominant (90%), while the camera layer adds a
+    // light 10% contribution.
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(buffer, 0, 0);
     var resultPixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
     var drawingPixels = buffer2Ctx.getImageData(0, 0, buffer2.width, buffer2.height);
     for (var j = 0; j < drawingPixels.data.length; j += 4) {
-      if (drawingPixels.data[j] !== 255 || drawingPixels.data[j + 1] !== 255 ||
-          drawingPixels.data[j + 2] !== 255) {
-        resultPixels.data[j] = drawingPixels.data[j];
-        resultPixels.data[j + 1] = drawingPixels.data[j + 1];
-        resultPixels.data[j + 2] = drawingPixels.data[j + 2];
-        resultPixels.data[j + 3] = drawingPixels.data[j + 3];
-      }
+      resultPixels.data[j] = Math.round(
+        drawingPixels.data[j] * WEBCAM_CANVAS_WEIGHT + resultPixels.data[j] * WEBCAM_CAMERA_WEIGHT);
+      resultPixels.data[j + 1] = Math.round(
+        drawingPixels.data[j + 1] * WEBCAM_CANVAS_WEIGHT + resultPixels.data[j + 1] * WEBCAM_CAMERA_WEIGHT);
+      resultPixels.data[j + 2] = Math.round(
+        drawingPixels.data[j + 2] * WEBCAM_CANVAS_WEIGHT + resultPixels.data[j + 2] * WEBCAM_CAMERA_WEIGHT);
+      resultPixels.data[j + 3] = Math.round(
+        drawingPixels.data[j + 3] * WEBCAM_CANVAS_WEIGHT + resultPixels.data[j + 3] * WEBCAM_CAMERA_WEIGHT);
     }
     ctx.putImageData(resultPixels, 0, 0);
     return { size: square, brightness: brightness };
@@ -358,7 +376,7 @@
     return (error && error.message) || name || String(error || 'Unknown error');
   }
 
-  function captureWebcam() {
+  function captureWebcam(mode) {
     if (webcamBusy) return;
     if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       say('Веб-камера доступна только на HTTPS-странице в современном браузере');
@@ -388,9 +406,9 @@
       return waitForVideoFrame(video);
     }).then(function () {
       if (token !== webcamToken) throw { cancelled: true };
-      var webcamImage = putWebcamUnderDrawing(video);
+      var webcamImage = putWebcamUnderDrawing(video, mode);
       var brightnessNote = webcamImage.brightness ? ' · яркость +' + webcamImage.brightness : '';
-      say('Фото с веб-камеры добавлено: ' + webcamImage.size + '×' + webcamImage.size + brightnessNote);
+      say(mode + ': фото добавлено: ' + webcamImage.size + '×' + webcamImage.size + brightnessNote);
     }).catch(function (error) {
       if (!error || !error.cancelled) say('Веб-камера: ' + webcamErrorMessage(error));
     }).then(function () {
@@ -400,6 +418,113 @@
       if (webcamStream === stream) webcamStream = null;
       if (token === webcamToken) setWebcamBusy(false);
     });
+  }
+
+  function makeMoveLine() {
+    var width = canvas.width;
+    var height = canvas.height;
+    var maximum = Math.max(1, Math.min(MOVE_MAX_LINE_LENGTH, Math.max(width, height)));
+    var minimum = Math.min(MOVE_MIN_LINE_LENGTH, maximum);
+    var length = minimum + Math.random() * (maximum - minimum);
+    var angle = Math.random() * Math.PI * 2;
+    var dx = Math.cos(angle) * length;
+    var dy = Math.sin(angle) * length;
+    var radius = MOVE_BRUSH_DIAMETER / 2;
+
+    // Choose the centre so both virtual endpoints and the soft brush normally
+    // stay inside the canvas. Small user-resized canvases may clip the brush.
+    var marginX = radius + Math.abs(dx) / 2;
+    var marginY = radius + Math.abs(dy) / 2;
+    var minCenterX = marginX, maxCenterX = width - marginX;
+    var minCenterY = marginY, maxCenterY = height - marginY;
+    var centerX = minCenterX <= maxCenterX ?
+      minCenterX + Math.random() * (maxCenterX - minCenterX) : width / 2;
+    var centerY = minCenterY <= maxCenterY ?
+      minCenterY + Math.random() * (maxCenterY - minCenterY) : height / 2;
+
+    return {
+      startX: centerX - dx / 2,
+      startY: centerY - dy / 2,
+      endX: centerX + dx / 2,
+      endY: centerY + dy / 2,
+      length: length
+    };
+  }
+
+  function sampleBilinear(data, imageWidth, imageHeight, x, y, output, outputIndex) {
+    x = Math.max(0, Math.min(imageWidth - 1, x));
+    y = Math.max(0, Math.min(imageHeight - 1, y));
+    var x0 = Math.floor(x), y0 = Math.floor(y);
+    var x1 = Math.min(imageWidth - 1, x0 + 1);
+    var y1 = Math.min(imageHeight - 1, y0 + 1);
+    var xWeight = x - x0, yWeight = y - y0;
+    var topLeft = (y0 * imageWidth + x0) * 4;
+    var topRight = (y0 * imageWidth + x1) * 4;
+    var bottomLeft = (y1 * imageWidth + x0) * 4;
+    var bottomRight = (y1 * imageWidth + x1) * 4;
+
+    for (var channel = 0; channel < 4; channel++) {
+      var top = data[topLeft + channel] + (data[topRight + channel] - data[topLeft + channel]) * xWeight;
+      var bottom = data[bottomLeft + channel] +
+        (data[bottomRight + channel] - data[bottomLeft + channel]) * xWeight;
+      output[outputIndex + channel] = Math.round(top + (bottom - top) * yWeight);
+    }
+  }
+
+  function moveCanvasImage() {
+    if (!canvas || !ctx) return;
+
+    var move = makeMoveLine();
+    var sourcePixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    var resultPixels = ctx.createImageData(canvas.width, canvas.height);
+    resultPixels.data.set(sourcePixels.data);
+
+    var dx = move.endX - move.startX;
+    var dy = move.endY - move.startY;
+    var length = Math.sqrt(dx * dx + dy * dy);
+    if (!length) return;
+    var directionX = dx / length;
+    var directionY = dy / length;
+    var radius = MOVE_BRUSH_DIAMETER / 2;
+    var radiusSquared = radius * radius;
+    var minX = Math.max(0, Math.floor(Math.min(move.startX, move.endX) - radius));
+    var maxX = Math.min(canvas.width - 1, Math.ceil(Math.max(move.startX, move.endX) + radius));
+    var minY = Math.max(0, Math.floor(Math.min(move.startY, move.endY) - radius));
+    var maxY = Math.min(canvas.height - 1, Math.ceil(Math.max(move.startY, move.endY) + radius));
+    var pressure = MOVE_PRESSURE *
+      (1 + (Math.random() * 2 - 1) * MOVE_RANDOM_PRESSURE_VARIATION);
+    pressure = Math.max(0, pressure);
+    var lineSquared = length * length;
+
+    // The circular brush is dragged from start to end. Each output pixel pulls
+    // a softly weighted source pixel from behind the drag direction, creating
+    // a subtle melted-film / Photoshop-smudge style deformation.
+    for (var y = minY; y <= maxY; y++) {
+      for (var x = minX; x <= maxX; x++) {
+        var pointX = x + 0.5 - move.startX;
+        var pointY = y + 0.5 - move.startY;
+        var along = (pointX * dx + pointY * dy) / lineSquared;
+        along = Math.max(0, Math.min(1, along));
+        var nearestX = move.startX + dx * along;
+        var nearestY = move.startY + dy * along;
+        var distanceX = x + 0.5 - nearestX;
+        var distanceY = y + 0.5 - nearestY;
+        var distanceSquared = distanceX * distanceX + distanceY * distanceY;
+        if (distanceSquared > radiusSquared) continue;
+
+        // Smoothstep falloff: zero at the round brush edge, one in its centre.
+        var edge = 1 - Math.sqrt(distanceSquared) / radius;
+        var brushWeight = edge * edge * (3 - 2 * edge);
+        var displacement = length * pressure * brushWeight;
+        var targetIndex = (y * canvas.width + x) * 4;
+        sampleBilinear(sourcePixels.data, canvas.width, canvas.height,
+          x - directionX * displacement, y - directionY * displacement,
+          resultPixels.data, targetIndex);
+      }
+    }
+
+    ctx.putImageData(resultPixels, 0, 0);
+    say('MOVE: ' + Math.round(length) + ' px · кисть ' + MOVE_BRUSH_DIAMETER + ' px');
   }
 
   function drawBorderText(text, color) {
@@ -730,8 +855,15 @@
       button(bottom, 'CLEAR', '', function () { clearCanvas(); });
       button(bottom, '----', '', function () { applySize(size - STEP); });
       button(bottom, '++++', '', function () { applySize(size + STEP); });
-      webcamButton = button(bottom, 'WEBCAM', '', captureWebcam);
-      webcamButton.title = 'Сделать чёрно-белый снимок с веб-камеры под рисунком';
+      var w1 = button(bottom, 'w1', '', function () { captureWebcam('color'); });
+      w1.title = 'Цветной снимок с веб-камеры под рисунком, без обработки';
+      var w2 = button(bottom, 'w2', '', function () { captureWebcam('gray16'); });
+      w2.title = 'Снимок с веб-камеры в 16 оттенках серого';
+      var w3 = button(bottom, 'w3', '', function () { captureWebcam('binary'); });
+      w3.title = 'Снимок с веб-камеры строго в чёрном и белом, не более 30% чёрных пикселей';
+      webcamButtons = [w1, w2, w3];
+      button(bottom, 'MOVE', '', moveCanvasImage).title =
+        'Слегка потянуть случайный участок изображения мягкой круглой кистью';
       button(bottom, 'SEND', 'font-weight:bold;', sendPicture);
       statusEl = el('span', 'margin-left:6px;color:#333;');
       statusEl.id = 'nosql_paint_status';
