@@ -964,7 +964,7 @@
       moveBtn.title = 'Режим растушёвки: кисть размазывает изображение ' +
         '(melted-film / Photoshop-smudge) вместо рисования цветом';
       setMoveMode(false);
-      button(bottom, 'SEND', 'font-weight:bold;', sendPicture);
+      button(bottom, 'ATTACH', 'font-weight:bold;', sendPicture);
       statusEl = el('span', 'margin-left:6px;color:#333;');
       statusEl.id = 'nosql_paint_status';
       bottom.appendChild(statusEl);
@@ -1424,7 +1424,7 @@
     if (timeEl) timeEl.textContent = fmtTime(elapsed);
     drawWaveform();
     setRecControls();
-    sayR(pcmSamples.length ? 'Stopped · raw PCM is ready for effects or SEND' : 'Empty recording');
+    sayR(pcmSamples.length ? 'Stopped · raw PCM is ready for effects or ATTACH' : 'Empty recording');
   }
 
   function pcmToFloat(value) {
@@ -2163,7 +2163,7 @@
     }
     if (recState === 'rec' || recState === 'pause') stopRec();
     if (!pcmSamples || !pcmSamples.length) {
-      sayR('Record audio before pressing SEND');
+      sayR('Record audio before pressing ATTACH');
       setRecControls();
       return;
     }
@@ -2263,7 +2263,7 @@
       recButtons.rec = button(bottom, 'REC', '', startRec);
       recButtons.pause = button(bottom, 'PAUSE', '', pauseRec);
       recButtons.stop = button(bottom, 'STOP', '', stopRec);
-      recButtons.send = button(bottom, 'SEND', 'font-weight:bold;', sendRec);
+      recButtons.send = button(bottom, 'ATTACH', 'font-weight:bold;', sendRec);
       recStatus = el('span', 'margin-left:6px;color:#333;');
       recStatus.id = 'nosql_rec_status';
       bottom.appendChild(recStatus);
