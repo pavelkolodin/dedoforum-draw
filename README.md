@@ -1,4 +1,6 @@
-# Как поставить
+![](./doc/img/banner.jpg)
+
+# Installation 💾
 
 ### Шаг 1
 ```
@@ -8,10 +10,10 @@ git clone https://github.com/pavelkolodin/dedoforum-draw.git
 ```
 
 ### Шаг 2
-Зайти в Google Chrome на такую страницу `chrome://extensions/` и в правом верхнем углу включить галку "Developer Mode".
+Google Chrome -> `chrome://extensions/`, справа наверху включить "Developer Mode".
 
 ### Шаг 3
-Нажать пнопку загрузки "незапакованных" extensions и выбрать каталог `~/git/dedoforum-draw/` из Шага 1 в появившемся окне.
+"Load unpacked" ("загрузить распакованное...") -> выбрать каталог `~/git/dedoforum-draw/` из Шага 1 в появившемся окне.
 
 ![Extension Button Load](./doc/img/install-extension-button-load.jpg)
 
@@ -19,7 +21,7 @@ git clone https://github.com/pavelkolodin/dedoforum-draw.git
 
 Нажать F5 на форуме. 
 
-# Как пользоваться
+# Как пользоваться 🧔
 
 ### Сочинить текст
 
