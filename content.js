@@ -803,10 +803,25 @@
     octx.stroke();
   }
 
+  function generateRandomLatinString() {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    
+    // Calculate a random length between 4 and 18 (inclusive)
+    const length = Math.floor(Math.random() * (18 - 4 + 1)) + 3;
+    
+    let result = '';
+    for (let i = 0; i < length; i++) {
+      const randomIndex = Math.floor(Math.random() * chars.length);
+      result += chars[randomIndex];
+    }
+    
+    return result;
+  }
+
   function sendPicture() {
     canvas.toBlob(function (blob) {
       if (!blob) { say('Не удалось получить изображение'); return; }
-      var file = new File([blob], 'drawing-' + Date.now() + '.jpg', { type: 'image/jpeg' });
+      var file = new File([blob], generateRandomLatinString() + '.jpg', { type: 'image/jpeg' });
       if (!attachFile(file, 'прикреплено: ' + file.name)) {
         say('Браузер не дал записать файл');
         return;
