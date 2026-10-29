@@ -1608,382 +1608,161 @@
   function reverbRec() { runPcmEffect('REVERB', reverbPcmAsync); }
   function normalizeRec() { runPcmEffect('NORMALIZE', normalizePcmAsync); }
 
-  function chooseOpusMime() {
-    if (!window.MediaRecorder || !window.MediaRecorder.isTypeSupported) {
-      throw new Error('MediaRecorder is not available');
+  /* Offline PCM -> Opus via the browser's native WebCodecs encoder.
+     Unlike MediaRecorder, this does not route the buffer through an
+     AudioContext / MediaStream, so encoding is not tied to playback speed. */
+  function readOpusPreSkip(description) {
+    if (!description) return 312; // libopus' usual 48 kHz lookahead.
+    var bytes;
+    if (description instanceof ArrayBuffer) {
+      bytes = new Uint8Array(description);
+    } else if (ArrayBuffer.isView(description)) {
+      bytes = new Uint8Array(description.buffer, description.byteOffset, description.byteLength);
+    } else {
+      return 312;
     }
-    var candidates = [
-      'audio/ogg;codecs=opus',
-      'audio/webm;codecs=opus',
-      'audio/webm'
-    ];
-    for (var i = 0; i < candidates.length; i++) {
-      try {
-        if (window.MediaRecorder.isTypeSupported(candidates[i])) {
-          return { mime: candidates[i], webm: candidates[i].indexOf('webm') >= 0 };
+    if (bytes.length >= 12 &&
+        bytes[0] === 79 && bytes[1] === 112 && bytes[2] === 117 && bytes[3] === 115 &&
+        bytes[4] === 72 && bytes[5] === 101 && bytes[6] === 97 && bytes[7] === 100) {
+      return bytes[10] | (bytes[11] << 8);
+    }
+    return 312;
+  }
+
+  function waitForEncoderQueue(encoder, maxQueueSize) {
+    if (encoder.encodeQueueSize <= maxQueueSize) return Promise.resolve();
+    return new Promise(function (resolve) {
+      function onDequeue() {
+        if (encoder.encodeQueueSize <= maxQueueSize) {
+          encoder.removeEventListener('dequeue', onDequeue);
+          resolve();
         }
-      } catch (e) {}
-    }
-    throw new Error('This browser has no Ogg/Opus or WebM/Opus encoder');
+      }
+      encoder.addEventListener('dequeue', onDequeue);
+      onDequeue();
+    });
   }
 
-  function resamplePcmForContext(pcm, contextRate, padSamples) {
-    var sourceLength = pcm.length + padSamples;
-    var outputLength = Math.ceil(sourceLength * contextRate / PCM_RATE);
-    var output = new Float32Array(outputLength);
-    if (contextRate === PCM_RATE) {
-      for (var i = 0; i < pcm.length; i++) output[i] = pcmToFloat(pcm[i]);
-      return output;
-    }
-    var step = PCM_RATE / contextRate;
-    for (var j = 0; j < outputLength; j++) {
-      var position = j * step;
-      var lower = Math.floor(position);
-      if (lower >= pcm.length) break;
-      var fraction = position - lower;
-      var a = pcmToFloat(pcm[lower]);
-      var b = lower + 1 < pcm.length ? pcmToFloat(pcm[lower + 1]) : 0;
-      output[j] = a + (b - a) * fraction;
-    }
-    return output;
-  }
-
-  function recordPcmWithMediaRecorder(pcm, mime, webmPadding, onProgress) {
+  function encodePcmWithWebCodecs(pcm, onProgress) {
     return new Promise(function (resolve, reject) {
-      var AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCtor) { reject(new Error('Web Audio API is not available')); return; }
+      var Encoder = window.AudioEncoder;
+      var AudioDataCtor = window.AudioData;
+      if (!Encoder || !AudioDataCtor) {
+        reject(new Error('This browser does not provide WebCodecs AudioEncoder; direct Opus encoding is unavailable'));
+        return;
+      }
 
-      var context, destination, source, recorder, watchdog, progressRaf = 0;
-      var sourceStartTime = 0, sourceStarted = false;
-      var chunks = [];
+      var config = {
+        codec: 'opus',
+        sampleRate: PCM_RATE,
+        numberOfChannels: 1,
+        bitrate: 64000
+      };
+      var encoder = null;
+      var packets = [];
+      var description = null;
       var settled = false;
-      var errorOnStop = null;
+      var cancelRequested = false;
+      var chunkFrames = 960; // 20 ms at 48 kHz.
 
-      function reportProgress(forceComplete) {
-        progressRaf = 0;
-        if (settled || !sourceStarted || !onProgress) return;
-        var processed = forceComplete ? pcm.length :
-          Math.min(pcm.length, Math.floor(Math.max(0, context.currentTime - sourceStartTime) * PCM_RATE));
-        onProgress(processed, pcm.length);
-        if (!forceComplete && processed < pcm.length) {
-          progressRaf = requestAnimationFrame(function () { reportProgress(false); });
-        }
-      }
-
-      function cleanup() {
-        if (watchdog) clearTimeout(watchdog);
-        if (progressRaf) cancelAnimationFrame(progressRaf);
-        if (source) {
-          try { source.disconnect(); } catch (e) {}
-        }
-        if (recorder && recorder.state !== 'inactive') {
-          try { recorder.stop(); } catch (e) {}
-        }
-        if (destination && destination.stream) {
-          destination.stream.getTracks().forEach(function (track) { track.stop(); });
-        }
-        if (context) {
-          try {
-            var closing = context.close();
-            if (closing && closing.catch) closing.catch(function () {});
-          } catch (e) {}
-        }
-      }
-
-      function finish(error, blob) {
+      function finish(error, result) {
         if (settled) return;
         settled = true;
         if (encodeCancel === cancel) encodeCancel = null;
-        cleanup();
+        if (encoder) {
+          try { encoder.close(); } catch (e) {}
+        }
         if (error) reject(error);
-        else resolve(blob);
+        else resolve(result);
       }
 
       function cancel() {
+        cancelRequested = true;
         finish(new Error('Encoding cancelled'));
       }
       encodeCancel = cancel;
 
-      try {
+      function output(chunk, metadata) {
+        if (settled) return;
         try {
-          context = new AudioContextCtor({ sampleRate: PCM_RATE, latencyHint: 'playback' });
-        } catch (e) {
-          context = new AudioContextCtor();
-        }
-        destination = context.createMediaStreamDestination();
-        try {
-          destination.channelCount = 1;
-          destination.channelCountMode = 'explicit';
-        } catch (e) {}
-        var padding = webmPadding ? Math.round(PCM_RATE * 0.5) : 0;
-        var floatPcm = resamplePcmForContext(pcm, context.sampleRate, padding);
-        var audioBuffer = context.createBuffer(1, floatPcm.length, context.sampleRate);
-        audioBuffer.getChannelData(0).set(floatPcm);
-        source = context.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(destination);
-
-        try {
-          recorder = new window.MediaRecorder(destination.stream, {
-            mimeType: mime,
-            audioBitsPerSecond: 64000
-          });
-        } catch (e) {
-          recorder = new window.MediaRecorder(destination.stream, { mimeType: mime });
-        }
-        recorder.ondataavailable = function (event) {
-          if (event.data && event.data.size) chunks.push(event.data);
-        };
-        recorder.onerror = function (event) {
-          errorOnStop = event && event.error ? event.error : new Error('Opus encoding failed');
-          finish(errorOnStop);
-        };
-        recorder.onstop = function () {
-          if (errorOnStop) { finish(errorOnStop); return; }
-          finish(null, new Blob(chunks, { type: recorder.mimeType || mime }));
-        };
-        source.onended = function () {
-          reportProgress(true);
-          if (watchdog) clearTimeout(watchdog);
-          if (recorder && recorder.state !== 'inactive') {
-            try { recorder.stop(); } catch (e) { finish(e); }
+          if (!description && metadata && metadata.decoderConfig && metadata.decoderConfig.description) {
+            description = metadata.decoderConfig.description;
           }
-        };
-
-        context.resume().then(function () {
-          if (settled) return;
-          recorder.start();
-          sourceStartTime = context.currentTime;
-          sourceStarted = true;
-          source.start(sourceStartTime);
-          reportProgress(false);
-          watchdog = setTimeout(function () {
-            if (source) {
-              try { source.stop(); } catch (e) {}
-            }
-            if (recorder && recorder.state !== 'inactive') {
-              try { recorder.stop(); } catch (e) { finish(e); }
-            }
-          }, audioBuffer.duration * 1000 + 30000);
-        }).catch(function (error) { finish(error); });
-      } catch (error) {
-        finish(error);
+          var packet = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(packet);
+          packets.push(packet);
+          if (onProgress && chunk.timestamp != null) {
+            var done = Math.max(0, Math.min(pcm.length, Math.floor(chunk.timestamp * PCM_RATE / 1000000)));
+            onProgress(done, pcm.length);
+          }
+        } catch (error) {
+          finish(error);
+        }
       }
+
+      function fail(error) {
+        if (!settled) finish(error || new Error('Opus encoding failed'));
+      }
+
+      async function run() {
+        try {
+          var support = await Encoder.isConfigSupported(config);
+          if (!support || !support.supported) {
+            throw new Error('This browser does not support WebCodecs Opus encoding');
+          }
+          if (cancelRequested) return;
+
+          encoder = new Encoder({ output: output, error: fail });
+          encoder.configure(config);
+
+          // Opus packets contain encoder lookahead. Feed 120 ms of trailing
+          // silence so the final granule can retain every original PCM sample
+          // after pre-skip is removed by the decoder.
+          var tailFrames = 6;
+          var frameCount = Math.ceil(pcm.length / chunkFrames) + tailFrames;
+          for (var frame = 0; frame < frameCount; frame++) {
+            if (cancelRequested || settled) return;
+            var offset = frame * chunkFrames;
+            var actualFrames = Math.max(0, Math.min(chunkFrames, pcm.length - offset));
+            // Pad the final input frame to 20 ms; the Ogg granule position below
+            // trims this padding so the attached file retains the exact duration.
+            var input = new Int16Array(chunkFrames);
+            input.set(pcm.subarray(offset, offset + actualFrames));
+            var audioData = new AudioDataCtor({
+              format: 's16',
+              sampleRate: PCM_RATE,
+              numberOfFrames: chunkFrames,
+              numberOfChannels: 1,
+              timestamp: Math.round(offset * 1000000 / PCM_RATE),
+              data: input
+            });
+            try {
+              encoder.encode(audioData);
+            } finally {
+              audioData.close();
+            }
+
+            // Bound the native queue and yield periodically so the forum page
+            // remains responsive even for long recordings.
+            if (encoder.encodeQueueSize > 8) await waitForEncoderQueue(encoder, 4);
+            if ((frame & 15) === 15) await new Promise(function (r) { setTimeout(r, 0); });
+          }
+
+          if (cancelRequested || settled) return;
+          await encoder.flush();
+          if (cancelRequested || settled) return;
+          if (!packets.length) throw new Error('The Opus encoder returned no packets');
+          var preSkip = readOpusPreSkip(description);
+          var blob = muxOpusPacketsToOgg(packets, preSkip, pcm.length);
+          if (onProgress) onProgress(pcm.length, pcm.length);
+          finish(null, blob);
+        } catch (error) {
+          fail(error);
+        }
+      }
+
+      run();
     });
-  }
-
-  function readEbmlVint(bytes, position, removeMarker) {
-    if (position >= bytes.length) return null;
-    var first = bytes[position];
-    var mask = 0x80;
-    var length = 1;
-    while (length <= 8 && !(first & mask)) { mask >>= 1; length++; }
-    if (length > 8 || position + length > bytes.length) return null;
-
-    var firstValue = removeMarker ? (first & (mask - 1)) : first;
-    var value = firstValue;
-    var unknown = false;
-    if (removeMarker) {
-      unknown = firstValue === mask - 1;
-      for (var u = 1; u < length; u++) {
-        if (bytes[position + u] !== 255) unknown = false;
-      }
-      if (length === 1 && firstValue !== mask - 1) unknown = false;
-    }
-    for (var i = 1; i < length; i++) value = value * 256 + bytes[position + i];
-    return { value: value, length: length, unknown: unknown };
-  }
-
-  function readEbmlElement(bytes, position) {
-    var id = readEbmlVint(bytes, position, false);
-    if (!id) return null;
-    var size = readEbmlVint(bytes, position + id.length, true);
-    if (!size) return null;
-    var dataStart = position + id.length + size.length;
-    var end = size.unknown ? null : dataStart + size.value;
-    if (end !== null && (end > bytes.length || end < dataStart)) return null;
-    return { id: id.value, dataStart: dataStart, end: end, size: size.value, unknown: size.unknown };
-  }
-
-  function readEbmlUInt(bytes, start, end) {
-    var value = 0;
-    for (var i = start; i < end; i++) value = value * 256 + bytes[i];
-    return value;
-  }
-
-  function readEbmlText(bytes, start, end) {
-    var result = '';
-    for (var i = start; i < end; i++) result += String.fromCharCode(bytes[i]);
-    return result;
-  }
-
-  function parseOpusTrack(bytes, start, end, state) {
-    var position = start;
-    var number = null, codec = '', codecPrivate = null, codecDelay = 0;
-    while (position < end) {
-      var element = readEbmlElement(bytes, position);
-      if (!element || element.end === null) break;
-      if (element.id === 0xD7) number = readEbmlUInt(bytes, element.dataStart, element.end);
-      else if (element.id === 0x86) codec = readEbmlText(bytes, element.dataStart, element.end);
-      else if (element.id === 0x63A2) codecPrivate = bytes.slice(element.dataStart, element.end);
-      else if (element.id === 0x56AA) codecDelay = readEbmlUInt(bytes, element.dataStart, element.end);
-      position = element.end;
-    }
-    if (codec === 'A_OPUS') {
-      state.trackNumber = number === null ? 1 : number;
-      state.codecPrivate = codecPrivate;
-      state.codecDelay = codecDelay;
-    }
-  }
-
-  function parseWebMTracks(bytes, start, end, state) {
-    var position = start;
-    while (position < end) {
-      var element = readEbmlElement(bytes, position);
-      if (!element || element.end === null) break;
-      if (element.id === 0xAE) parseOpusTrack(bytes, element.dataStart, element.end, state);
-      position = element.end;
-    }
-  }
-
-  function parseWebMBlock(bytes, start, end, state) {
-    var track = readEbmlVint(bytes, start, true);
-    if (!track) return;
-    var position = start + track.length;
-    if (position + 3 > end) return;
-    var trackNumber = track.value;
-    position += 2;
-    var flags = bytes[position++];
-    if (state.trackNumber === null) state.trackNumber = trackNumber;
-    if (trackNumber !== state.trackNumber) return;
-
-    var lace = (flags >> 1) & 3;
-    if (lace === 0) {
-      if (position < end) state.packets.push(bytes.slice(position, end));
-      return;
-    }
-    if (position >= end) return;
-    var frameCount = bytes[position++] + 1;
-    var sizes = [];
-
-    if (lace === 1) {
-      var total = 0;
-      for (var x = 0; x < frameCount - 1; x++) {
-        var frameSize = 0, part;
-        do {
-          if (position >= end) return;
-          part = bytes[position++];
-          frameSize += part;
-        } while (part === 255);
-        sizes.push(frameSize);
-        total += frameSize;
-      }
-      sizes.push(end - position - total);
-    } else if (lace === 2) {
-      var remaining = end - position;
-      if (remaining % frameCount !== 0) return;
-      var fixedSize = remaining / frameCount;
-      for (var f = 0; f < frameCount; f++) sizes.push(fixedSize);
-    } else {
-      var firstSize = readEbmlVint(bytes, position, true);
-      if (!firstSize) return;
-      position += firstSize.length;
-      sizes.push(firstSize.value);
-      var sum = firstSize.value;
-      var previousSize = firstSize.value;
-      for (var d = 1; d < frameCount - 1; d++) {
-        var deltaVint = readEbmlVint(bytes, position, true);
-        if (!deltaVint) return;
-        position += deltaVint.length;
-        var bias = Math.pow(2, 7 * deltaVint.length - 1) - 1;
-        var nextSize = previousSize + deltaVint.value - bias;
-        if (nextSize < 0) return;
-        sizes.push(nextSize);
-        sum += nextSize;
-        previousSize = nextSize;
-      }
-      sizes.push(end - position - sum);
-    }
-
-    var dataPosition = position;
-    for (var i = 0; i < sizes.length; i++) {
-      var size = sizes[i];
-      if (size < 0 || dataPosition + size > end) return;
-      if (size > 0) state.packets.push(bytes.slice(dataPosition, dataPosition + size));
-      dataPosition += size;
-    }
-  }
-
-  function parseWebMBlockGroup(bytes, start, end, state) {
-    var position = start;
-    while (position < end) {
-      var element = readEbmlElement(bytes, position);
-      if (!element || element.end === null) break;
-      if (element.id === 0xA1) parseWebMBlock(bytes, element.dataStart, element.end, state);
-      position = element.end;
-    }
-  }
-
-  function isSegmentLevelElement(id) {
-    return id === 0x114D9B74 || id === 0x1549A966 || id === 0x1654AE6B ||
-      id === 0x1F43B675 || id === 0x1C53BB6B || id === 0x1254C367 ||
-      id === 0x1941A469 || id === 0x1043A770;
-  }
-
-  function parseWebMCluster(bytes, start, limit, unknownSize, state) {
-    var position = start;
-    while (position < limit) {
-      var element = readEbmlElement(bytes, position);
-      if (!element) break;
-      if (unknownSize && isSegmentLevelElement(element.id)) return position;
-      if (element.end === null) break;
-      if (element.id === 0xA3) parseWebMBlock(bytes, element.dataStart, element.end, state);
-      else if (element.id === 0xA0) parseWebMBlockGroup(bytes, element.dataStart, element.end, state);
-      position = element.end;
-    }
-    return position;
-  }
-
-  function parseWebMSegment(bytes, start, limit, state) {
-    var position = start;
-    while (position < limit) {
-      var element = readEbmlElement(bytes, position);
-      if (!element) break;
-      if (element.id === 0x1654AE6B && element.end !== null) {
-        parseWebMTracks(bytes, element.dataStart, element.end, state);
-      } else if (element.id === 0x1F43B675) {
-        var clusterLimit = element.end === null ? limit : element.end;
-        position = parseWebMCluster(bytes, element.dataStart, clusterLimit, element.end === null, state);
-        continue;
-      }
-      if (element.end === null) break;
-      position = element.end;
-    }
-  }
-
-  function parseWebMOpus(bytes) {
-    var state = { trackNumber: null, codecPrivate: null, codecDelay: 0, packets: [] };
-    var position = 0;
-    while (position < bytes.length) {
-      var element = readEbmlElement(bytes, position);
-      if (!element) { position++; continue; }
-      if (element.id === 0x18538067) {
-        parseWebMSegment(bytes, element.dataStart, element.end === null ? bytes.length : element.end, state);
-        break;
-      }
-      if (element.end === null) break;
-      position = element.end;
-    }
-    if (!state.packets.length) throw new Error('Could not read Opus packets from WebM');
-
-    var preSkip = 0;
-    if (state.codecPrivate && state.codecPrivate.length >= 12 &&
-        readEbmlText(state.codecPrivate, 0, 8) === 'OpusHead') {
-      preSkip = state.codecPrivate[10] | (state.codecPrivate[11] << 8);
-    }
-    if (!preSkip && state.codecDelay) preSkip = Math.round(state.codecDelay * PCM_RATE / 1000000000);
-    if (!preSkip) preSkip = 312;
-    return { packets: state.packets, preSkip: preSkip };
   }
 
   function opusPacketSamples(packet) {
@@ -2095,10 +1874,7 @@
     return tags;
   }
 
-  function remuxWebMOpusToOgg(bytes, targetSamples) {
-    var parsed = parseWebMOpus(bytes);
-    var packets = parsed.packets;
-    var preSkip = parsed.preSkip;
+  function muxOpusPacketsToOgg(packets, preSkip, targetSamples) {
     var durations = new Array(packets.length);
     var decodedSamples = 0;
     for (var i = 0; i < packets.length; i++) {
@@ -2157,17 +1933,7 @@
   }
 
   function encodePcmToOgg(pcm, onProgress) {
-    var choice;
-    try { choice = chooseOpusMime(); }
-    catch (error) { return Promise.reject(error); }
-
-    return recordPcmWithMediaRecorder(pcm, choice.mime, choice.webm, onProgress).then(function (blob) {
-      if (!blob || !blob.size) throw new Error('The Opus encoder returned an empty file');
-      if (!choice.webm) return new Blob([blob], { type: 'audio/ogg;codecs=opus' });
-      return blob.arrayBuffer().then(function (buffer) {
-        return remuxWebMOpusToOgg(new Uint8Array(buffer), pcm.length);
-      });
-    });
+    return encodePcmWithWebCodecs(pcm, onProgress);
   }
 
   function sendRec() {
