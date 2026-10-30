@@ -5,6 +5,7 @@
 
   var BTN_ID = 'nosql_paint_button';
   var TEXT_BTN_ID = 'nosql_text_button';
+  var FIT_TEXT_BTN_ID = 'nosql_fit_text_button';
   var REC_BTN_ID = 'nosql_rec_button';
   var PAINT_MODAL_ID = 'nosql_paint_modal';
   var REC_MODAL_ID = 'nosql_rec_modal';
@@ -24,6 +25,15 @@
   var QUALITY = 0.95;                     // JPEG quality.
   var BORDER_TEXT_COLOR = 'rgba(128, 128, 128, 0.75)'; // Default color for perimeter text.
   var BORDER_TEXT_HEIGHT = 20;                        // Font height (px) along perimeter.
+
+  /* FitText tool: the text keeps one fixed font size and the finished canvas is
+     trimmed down to the area the text really occupies. */
+  var FIT_TEXT_FONT_SIZE = 35;                        // Fixed font size, px.
+  var FIT_TEXT_LINE_HEIGHT = Math.round(FIT_TEXT_FONT_SIZE * 1.25); // Baseline step, px.
+  var FIT_TEXT_FONT = FIT_TEXT_FONT_SIZE + 'px Arial, sans-serif';
+  var FIT_TEXT_BG_COLOR = '#EEEEEE';                  // Canvas background (also the colour cut away).
+  var FIT_TEXT_TEXT_COLOR = '#000000';                // Text colour.
+  var FIT_TEXT_BG_TOLERANCE = 2;                      // Per-channel tolerance when detecting background.
 
   var WAVE_W = 600, WAVE_H = 200;         // Waveform canvas size.
 
@@ -149,16 +159,93 @@
   }
 
   var canvas, ctx, overlay, octx, statusEl, paintModal;
+  // editorMode: 'paint' | 'text' | 'fittext'
   var editorTitleNode = null, editorMode = 'paint';
+  var clearColor = '#ffffff';   // Canvas background; FitText switches it to FIT_TEXT_BG_COLOR.
 
   function clearCanvas() {
     if (!ctx) return;
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = clearColor;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     if (overlay && octx) octx.clearRect(0, 0, overlay.width, overlay.height);
     drawing = false;
     prev = null;
     hover = null;
+  }
+
+  // Resizes the drawing canvas and the brush-cursor overlay together.
+  function resizeCanvas(newWidth, newHeight) {
+    canvas.width = newWidth;
+    canvas.height = newHeight;
+    canvas.style.width = newWidth + 'px';
+    canvas.style.height = newHeight + 'px';
+    overlay.width = newWidth;
+    overlay.height = newHeight;
+    overlay.style.width = newWidth + 'px';
+    overlay.style.height = newHeight + 'px';
+  }
+
+  // Cuts the canvas down to newWidth x newHeight, keeping the top-left corner.
+  function cropCanvas(newWidth, newHeight) {
+    newWidth = Math.max(1, Math.min(canvas.width, Math.round(newWidth)));
+    newHeight = Math.max(1, Math.min(canvas.height, Math.round(newHeight)));
+    if (newWidth === canvas.width && newHeight === canvas.height) return;
+
+    var copy = document.createElement('canvas');
+    copy.width = newWidth;
+    copy.height = newHeight;
+    copy.getContext('2d').drawImage(canvas, 0, 0, newWidth, newHeight, 0, 0, newWidth, newHeight);
+
+    resizeCanvas(newWidth, newHeight);
+    clearCanvas();
+    ctx.drawImage(copy, 0, 0);
+    // `size` is the square sheet size of the Paint/Text tools and is left
+    // alone here, so they come back at the size they had before FitText.
+  }
+
+  function colorToRgb(cssColor) {
+    var hex = String(cssColor || '').replace('#', '');
+    if (hex.length === 3) {
+      hex = hex.charAt(0) + hex.charAt(0) + hex.charAt(1) + hex.charAt(1) +
+        hex.charAt(2) + hex.charAt(2);
+    }
+    return {
+      r: parseInt(hex.substr(0, 2), 16) || 0,
+      g: parseInt(hex.substr(2, 2), 16) || 0,
+      b: parseInt(hex.substr(4, 2), 16) || 0
+    };
+  }
+
+  // Finds how far right and how far down the drawing goes.  The result is used
+  // only to cut the right and the bottom side: the left and the top stay put.
+  function findContentBounds(backgroundColor) {
+    var w = canvas.width, h = canvas.height;
+    var data;
+    try {
+      data = ctx.getImageData(0, 0, w, h).data;
+    } catch (err) {
+      return null;   // Canvas is not readable (tainted): nothing to trim.
+    }
+    var bg = colorToRgb(backgroundColor);
+    var tol = FIT_TEXT_BG_TOLERANCE;
+    var maxX = -1, maxY = -1;
+
+    for (var y = 0; y < h; y++) {
+      var row = y * w * 4;
+      // Right-to-left: the first difference found is the rightmost used pixel
+      // of the row, so most rows stop after a couple of steps.
+      for (var x = w - 1; x >= 0; x--) {
+        var i = row + x * 4;
+        if (Math.abs(data[i] - bg.r) > tol ||
+            Math.abs(data[i + 1] - bg.g) > tol ||
+            Math.abs(data[i + 2] - bg.b) > tol) {
+          if (x > maxX) maxX = x;
+          maxY = y;
+          break;
+        }
+      }
+    }
+    return { width: maxX + 1, height: maxY + 1 };
   }
 
   function say(text) { if (statusEl) statusEl.textContent = text || ''; }
@@ -661,6 +748,7 @@
   }
 
   function renderText(text) {
+    clearColor = '#ffffff';
     clearCanvas();
     text = String(text || '').replace(/\r\n?/g, '\n');
     var rawLines = text.split('\n');
@@ -717,27 +805,77 @@
     }
   }
 
+  /* FitText: same idea as Text, but the font size is always FIT_TEXT_FONT_SIZE
+     and the finished canvas is cut down to the text area (right and bottom
+     only).  Lines are never wrapped or shrunk: a line that does not fit into
+     the canvas width is clipped by the canvas edge, and drawing stops as soon
+     as the canvas is over vertically. */
+  function renderFitText(text) {
+    clearColor = FIT_TEXT_BG_COLOR;   // Must be set before clearCanvas().
+    clearCanvas();
+
+    text = String(text || '').replace(/\r\n?/g, '\n');
+    var lines = text.split('\n');
+
+    ctx.save();
+    ctx.font = FIT_TEXT_FONT;
+    ctx.fillStyle = FIT_TEXT_TEXT_COLOR;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+
+    var drawn = 0;
+    for (var i = 0; i < lines.length; i++) {
+      var y = i * FIT_TEXT_LINE_HEIGHT;
+      if (y >= canvas.height) break;   // Out of canvas height: stop drawing.
+      // No maxWidth here: an over-wide line is simply cut off by the edge.
+      if (lines[i].length) ctx.fillText(lines[i], 0, y);
+      drawn++;
+    }
+    ctx.restore();
+
+    // Cut away the unused background on the right and at the bottom.  The
+    // left and the top are never touched.
+    var bounds = findContentBounds(FIT_TEXT_BG_COLOR);
+    var empty = !bounds || bounds.width < 1 || bounds.height < 1;
+    if (empty) {
+      cropCanvas(1, 1);          // Nothing was drawn: nothing to keep.
+      say('FitText: в поле ввода нет текста');
+      return;
+    }
+    cropCanvas(bounds.width, bounds.height);
+
+    say('FitText: ' + FIT_TEXT_FONT_SIZE + ' px · ' + canvas.width + '×' + canvas.height +
+      (drawn < lines.length ? ' · текст не влез целиком' : ''));
+  }
+
+  // Longest side of the canvas: the size the ---- / ++++ buttons step from.
+  function currentSide() {
+    return Math.max(canvas.width, canvas.height);
+  }
+
   function applySize(newSize) {
     newSize = Math.max(MIN, Math.min(MAX, newSize));
-    if (newSize === canvas.width) return;
+    // The paint canvas is square.  A FitText canvas is not (it is exactly as
+    // large as the text), so there the buttons scale it proportionally instead
+    // of stretching the picture into a square.
+    var targetW = newSize, targetH = newSize;
+    if (canvas.width !== canvas.height) {
+      var scale = newSize / currentSide();
+      targetW = Math.max(1, Math.round(canvas.width * scale));
+      targetH = Math.max(1, Math.round(canvas.height * scale));
+    }
+    if (targetW === canvas.width && targetH === canvas.height) return;
+
     var old = document.createElement('canvas');
     old.width = canvas.width;
     old.height = canvas.height;
     old.getContext('2d').drawImage(canvas, 0, 0);
 
-    canvas.width = newSize;
-    canvas.height = newSize;
-    canvas.style.width = newSize + 'px';
-    canvas.style.height = newSize + 'px';
-    overlay.width = newSize;
-    overlay.height = newSize;
-    overlay.style.width = newSize + 'px';
-    overlay.style.height = newSize + 'px';
-
+    resizeCanvas(targetW, targetH);
     clearCanvas();
-    ctx.drawImage(old, 0, 0, old.width, old.height, 0, 0, newSize, newSize);
+    ctx.drawImage(old, 0, 0, old.width, old.height, 0, 0, targetW, targetH);
     size = newSize;
-    say('Холст: ' + newSize + '×' + newSize);
+    say('Холст: ' + targetW + '×' + targetH);
   }
 
   function point(e) {
@@ -819,6 +957,7 @@
   }
 
   function sendPicture() {
+    var textMode = (editorMode === 'text' || editorMode === 'fittext');
     canvas.toBlob(function (blob) {
       if (!blob) { say('Не удалось получить изображение'); return; }
       var file = new File([blob], generateRandomLatinString() + '.jpg', { type: 'image/jpeg' });
@@ -826,6 +965,8 @@
         say('Браузер не дал записать файл');
         return;
       }
+      // The text has now become an attachment, so it may leave the textarea.
+      if (textMode) clearUsedText();
       closeModal(paintModal);
       say('готово: ' + file.name + ' (' + Math.round(blob.size / 1024) + ' КБ, ' +
           canvas.width + '×' + canvas.height + ')');
@@ -963,8 +1104,8 @@
 
       var bottom = el('div', 'margin-top:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;');
       button(bottom, 'CLEAR', '', function () { clearCanvas(); });
-      button(bottom, '----', '', function () { applySize(size - STEP); });
-      button(bottom, '++++', '', function () { applySize(size + STEP); });
+      button(bottom, '----', '', function () { applySize(currentSide() - STEP); });
+      button(bottom, '++++', '', function () { applySize(currentSide() + STEP); });
       var w1 = button(bottom, 'w1', '', function () { captureWebcam('color'); });
       w1.title = 'Цветной снимок с веб-камеры под рисунком, без обработки';
       var w2 = button(bottom, 'w2', '', function () { captureWebcam('gray16'); });
@@ -987,15 +1128,48 @@
     });
   }
 
+  // A FitText canvas is as large as the text and therefore not square.  Paint
+  // and Text need the usual square sheet back.
+  function ensureSquareCanvas() {
+    if (!canvas || canvas.width === canvas.height) return;
+    var side = Math.max(MIN, Math.min(MAX, size));
+    resizeCanvas(side, side);
+  }
+
   function openPaintEditor() {
     if (!paintModal) buildPaintModal();
     if (editorMode !== 'paint') {
+      clearColor = '#ffffff';
+      ensureSquareCanvas();
       clearCanvas();
       editorMode = 'paint';
     }
     setEditorTitle('Рисовалка (вложение)');
     openModal(paintModal);
     say('');
+  }
+
+  /* The textarea is only cleared when the picture made from its text is really
+     attached (ATTACH).  Closing the editor with the × button keeps the text,
+     so the author does not lose what was typed. */
+
+  var textSourceArea = null;    // textarea the text was taken from
+  var textSourceValue = null;   // its value at the moment the text was rendered
+
+  function rememberTextSource(area) {
+    textSourceArea = area;
+    textSourceValue = area.value;
+  }
+
+  function clearUsedText() {
+    if (!textSourceArea) return;
+    // If the author has changed the field in the meantime, keep the new text.
+    if (textSourceArea.value === textSourceValue) {
+      textSourceArea.value = '';
+      textSourceArea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    textSourceArea = null;
+    textSourceValue = null;
   }
 
   function openTextEditor() {
@@ -1007,8 +1181,28 @@
     if (!paintModal) buildPaintModal();
     editorMode = 'text';
     setEditorTitle('Текст на холсте (вложение)');
+    ensureSquareCanvas();   // after FitText the sheet has to be square again
     renderText(message.value);
-    message.value = "";
+    rememberTextSource(message);   // cleared later, on ATTACH only
+    openModal(paintModal);
+  }
+
+  // FitText: the same as Text, but the font size is fixed and the canvas is
+  // trimmed to the text area instead of being a full 800x800 sheet.
+  function openFitTextEditor() {
+    var message = document.querySelector('textarea#message');
+    if (!message) {
+      window.alert('Textarea #message was not found');
+      return;
+    }
+    if (!paintModal) buildPaintModal();
+    editorMode = 'fittext';
+    setEditorTitle('FitText: текст 35 px без полей (вложение)');
+    // Always start from a clean square sheet (800x800 by default): after a
+    // previous FitText run the canvas is only as large as the old text.
+    ensureSquareCanvas();
+    renderFitText(message.value);
+    rememberTextSource(message);   // cleared later, on ATTACH only
     openModal(paintModal);
   }
 
@@ -2083,6 +2277,15 @@
     tbtn.title = 'Write the message text onto the canvas';
     tbtn.onclick = openTextEditor;
     box.appendChild(tbtn);
+
+    // FitText: fixed 35 px font, canvas trimmed to the size of the text.
+    var ftbtn = el('button', 'padding:2px 10px;cursor:default;font:12px Arial,sans-serif;');
+    ftbtn.type = 'button';
+    ftbtn.id = FIT_TEXT_BTN_ID;
+    ftbtn.textContent = 'FitText';
+    ftbtn.title = 'Write the text in a fixed 35 px font and cut the canvas down to the text area';
+    ftbtn.onclick = openFitTextEditor;
+    box.appendChild(ftbtn);
 
     var rbtn = el('button', 'padding:2px 10px;cursor:default;font:12px Arial,sans-serif;');
     rbtn.type = 'button';
